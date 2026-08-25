@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>QQ 群 AI 代理 · 本机控制台</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+</head>
+<body>
+  {% set app_state = state or {} %}
+  {% set app_settings = settings or {} %}
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">Q</span>
+      <div>
+        <h1>QQ 群 AI 代理</h1>
+        <p>本机控制台 · 仅监听 127.0.0.1</p>
+      </div>
+    </div>
+    <nav class="topbar-nav" aria-label="页面导航">
+      <a href="#overview">概览</a>
+      <a href="#admin-chat">AI 对话</a>
+      <a href="#groups-title">群聊</a>
+      <a href="#settings-title">设置</a>
+      <a href="#audits-title">审计</a>
+    </nav>
+    <div class="topbar-actions">
+      <a class="button button-secondary" href="/healthz" target="_blank" rel="noopener">检查健康状态</a>
+      <button class="button button-secondary" type="button" id="refresh-page">刷新数据</button>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow">QQ AI GROUP AGENT</p>
+        <h2 id="hero-title">让群聊保持上下文。</h2>
+        <p>把 NapCat 的实时消息、长期记忆和模型工具，收进一个安静、清晰的本机工作台。</p>
+        <div class="hero-meta">
+          <span class="hero-status-dot {% if app_state.get('onebot_connected') %}is-online{% endif %}"></span>
+          <span>{% if app_state.get('onebot_connected') %}OneBot 已连接{% else %}等待 OneBot 连接{% endif %}</span>
+          <span class="hero-separator">·</span>
+          <span>数据仅保存在本机</span>
+        </div>
+      </div>
+      <div class="hero-orbit" aria-hidden="true">
+        <span class="orbit-ring orbit-ring-one"></span>
+        <span class="orbit-ring orbit-ring-two"></span>
+        <span class="orbit-core">Q</span>
+      </div>
+    </section>
+
+    <section class="notice notice-warning" aria-label="本地与隐私提醒">
+      <div class="notice-icon" aria-hidden="true">!</div>
+      <div>
+        <strong>本地服务与内容外发提醒</strong>
+        <p>控制台不提供公网登录，也不保存 QQ 密码；QQ 登录由 QQNT/NapCat 的扫码流程完成。启用群后，已启用群的消息、图片和摘要会按当前配置发送至你的 OpenAI 兼容 API。请先取得群成员同意，并妥善保管 OneBot Token 和 API Key。</p>
+      </div>
+    </section>
+
+    {% set runtime_warning = app_state.get('runtime_warning') or app_state.get('last_warning') %}
+    {% if runtime_warning %}
+    <section class="notice notice-danger" aria-label="运行告警">
+      <div class="notice-icon" aria-hidden="true">!</div>
+      <div>
+        <strong>运行告警</strong>
+        <p>{{ runtime_warning }}</p>
+      </div>
+    </section>
+    {% endif %}
+
+    {% if not app_settings.get('api_key_configured') or not app_settings.get('onebot_token_configured') %}
+    <section class="notice notice-warning" aria-label="首次配置向导">
+      <div class="notice-icon" aria-hidden="true">1</div>
+      <div>
+        <strong>首次配置向导</strong>
+        <p>先在下方保存 OpenAI 兼容 API、模型名和 OneBot Token；再在 NapCat 中用二维码登录专用 QQ，并把反向 WebSocket 指向 <code>ws://127.0.0.1:8765/onebot/v11</code>。连接成功后，选择需要管理的群并明确启用。</p>
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="status-grid" id="overview" aria-label="运行概况">
+      <article class="metric-card">
+        <span class="metric-label">NapCat / OneBot</span>
+        {% if app_state.get('onebot_connected') %}
+          <strong class="metric-value success">已连接</strong>
+        {% else %}
+          <strong class="metric-value danger">未连接</strong>
+        {% endif %}
+        <span class="metric-detail">{{ app_state.get('onebot_status') or '等待反向 WebSocket 连接' }}</span>
+      </article>
+      <article class="metric-card">
+        <span class="metric-label">已启用群</span>
+        <strong class="metric-value">{{ app_state.get('enabled_group_count', 0) }}</strong>
+        <span class="metric-detail">新发现的群默认不会采集</span>
+      </article>
+      <article class="metric-card">
+        <span class="metric-label">待处理事件</span>
+        <strong class="metric-value">{{ app_state.get('pending_event_count', 0) }}</strong>
+        <span class="metric-detail">同一群按时间顺序串行处理</span>
+      </article>
+      <article class="metric-card">
+        <span class="metric-label">媒体存储</span>
+        <strong class="metric-value">{{ app_state.get('media_usage_label') or '0 B' }}</strong>
+        <span class="metric-detail">预算 {{ app_settings.get('media_budget_gib', 20) }} GiB</span>
+      </article>
+    </section>
+
+    <section class="admin-grid" id="admin-chat" aria-label="管理员与 AI 对话">
+      <section class="panel admin-chat-panel" aria-labelledby="admin-chat-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">仅本机管理员</p>
+            <h2 id="admin-chat-title">与 AI 对话</h2>
+          </div>
+          <span class="badge">不会发送到 QQ 群</span>
+        </div>
+        <div class="admin-chat-intro">
+          <p>在这里直接告诉 AI 你希望机器人怎样回答、参与群聊或处理长期偏好。AI 可以只回复你的要求；它也可以在确有长期价值时，使用唯一的记忆工具写入 <code>rules.md</code>。</p>
+          <p>群聊原文不能写入规则，也不能改变这个工具的边界。下方文件仅供查看；请通过与 AI 对话来请求增删规则。</p>
+        </div>
+        <form class="admin-chat-form" method="post" action="/admin/chat" autocomplete="off">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label for="admin-chat-message">
+            <span>给 AI 的要求</span>
+            <textarea id="admin-chat-message" name="message" rows="5" maxlength="{{ admin_chat_max_chars or 12000 }}" required placeholder="例如：以后回答算法题时先给结论，再解释关键改动；如果这是长期偏好，请决定是否写入 rules.md。"></textarea>
+            <small>单次最多 {{ admin_chat_max_chars or 12000 }} 个字符。AI 是否写入长期记忆由它根据请求决定，也可能只给出回复。</small>
+          </label>
+          <div class="form-actions">
+            <button class="button" type="submit">发送给 AI</button>
+          </div>
+        </form>
+
+        <div class="admin-history" aria-label="管理员对话历史">
+          <div class="subpanel-heading">
+            <h3>最近对话</h3>
+            <span class="muted">最多显示 40 条</span>
+          </div>
+          {% if admin_messages %}
+          <div class="admin-message-list">
+            {% for message in admin_messages %}
+              {% set message_role = (message.get('role') or 'assistant')|lower %}
+              {% set message_content = message.get('content') or message.get('text') or message.get('message') or '' %}
+              <article class="admin-message admin-message-{{ message_role }}">
+                <div class="admin-message-meta">
+                  <strong>
+                    {% if message_role in ['user', 'admin', 'administrator'] %}
+                      管理员
+                    {% elif message_role == 'tool' %}
+                      记忆工具
+                    {% elif message_role == 'system' %}
+                      系统
+                    {% else %}
+                      AI
+                    {% endif %}
+                  </strong>
+                  <time>{{ message.get('created_at') or message.get('time') or '' }}</time>
+                </div>
+                {% if message_content %}
+                  <p>{{ message_content }}</p>
+                {% endif %}
+                {% if message.get('tool_name') %}
+                  {% set tool_result = message.get('result_json') or message.get('tool_result') %}
+                  <details class="admin-tool-result">
+                    <summary>工具结果：{{ message.get('tool_name') }}</summary>
+                    {% if tool_result %}
+                      <pre>{% if tool_result is string %}{{ tool_result }}{% else %}{{ tool_result | tojson(indent=2) }}{% endif %}</pre>
+                    {% endif %}
+                  </details>
+                {% endif %}
+              </article>
+            {% endfor %}
+          </div>
+          {% else %}
+          <div class="empty-state compact"><p>还没有管理员对话。告诉 AI 你的偏好，或让它决定是否将长期规则写入 rules.md。</p></div>
+          {% endif %}
+        </div>
+      </section>
+
+      <aside class="panel rules-panel" aria-labelledby="rules-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">长期记忆（只读）</p>
+            <h2 id="rules-title">rules.md</h2>
+          </div>
+        </div>
+        <div class="rules-content">
+          <p class="rules-path"><span>本机文件</span> <code>{{ rules_path_label or 'rules.md' }}</code></p>
+          <p class="muted">这是 AI 在获得长期记忆写入许可后维护的规则。页面不能直接编辑，避免绕过 AI 的规则审查与工具审计。</p>
+          {% if rules_text %}
+            <pre class="rules-preview">{{ rules_text }}</pre>
+          {% else %}
+            <div class="empty-state compact"><p>尚未写入长期规则。AI 可以在与你的对话中选择写入，也可以保持为空。</p></div>
+          {% endif %}
+        </div>
+      </aside>
+    </section>
+
+    <div class="dashboard-grid">
+      <section class="panel groups-panel" aria-labelledby="groups-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">会话控制</p>
+            <h2 id="groups-title">发现的群与私聊</h2>
+          </div>
+          <span class="muted">页面每 30 秒自动更新</span>
+        </div>
+
+        {% if groups %}
+        <div class="group-list">
+          {% for group in groups %}
+          {% set group_id = group.get('group_id') %}
+          {% set is_enabled = group.get('enabled', false) %}
+          {% set is_private = group.get('conversation_type') == 'private' or group_id.startswith('private:') %}
+          <article class="group-card {% if is_enabled %}group-enabled{% endif %}">
+            <div class="group-summary">
+              <div>
+                <h3>{% if is_private %}私聊 · {% endif %}{{ group.get('group_name') or group.get('name') or ('会话 ' ~ group_id) }}</h3>
+                <p class="mono">{{ group_id }}</p>
+              </div>
+              {% if is_enabled %}
+                <span class="badge badge-success">已启用</span>
+              {% else %}
+                <span class="badge">未启用</span>
+              {% endif %}
+            </div>
+            <dl class="group-meta">
+              <div><dt>待处理</dt><dd>{{ group.get('pending_count', 0) }}</dd></div>
+                <div><dt>历史摘要</dt><dd>{{ group.get('last_summary_at') or group.get('summary_updated_at') or '尚未归档旧消息' }}</dd></div>
+              <div><dt>状态</dt><dd>{{ group.get('status') or '正常' }}</dd></div>
+            </dl>
+            {% if group.get('workspace_path') %}
+              <p class="workspace-path">Agent 工作目录：<code>{{ group.get('workspace_path') }}</code></p>
+            {% endif %}
+            {% if group.get('last_error') %}
+              <section class="inline-error" aria-label="最近处理失败或告警">
+                <strong>最近处理失败或告警</strong>
+                <pre>{{ group.get('last_error') }}</pre>
+              </section>
+            {% endif %}
+            {% if group.get('summary') %}
+              <details class="rolling-summary">
+                <summary>当前累计历史摘要（仅维护早于最新 50K 原文的内容）</summary>
+                <pre>{{ group.get('summary') }}</pre>
+              </details>
+            {% else %}
+              <p class="rolling-summary-empty">尚无需要归档的旧消息；最新约 50K 会话原文会直接提供给 AI。</p>
+            {% endif %}
+            {% set group_memories = group.get('memories') or [] %}
+            <details class="group-memory" id="group-memory-{{ group_id }}">
+              <summary>
+                <span>群长期记忆</span>
+                <span class="badge">{{ group_memories|length }} 条（含历史状态）</span>
+              </summary>
+              <div class="group-memory-body">
+                <p class="memory-explainer">记忆按群完全隔离，使用结构化事实、原消息证据和版本状态维护，不依赖向量模型。AI 只能使用有来源的有效记忆；被更正、撤回或软删除的旧版本会保留审计，但不再作为事实使用。</p>
+                {% if group.get('memory_load_error') %}
+                  <p class="inline-error memory-load-error">{{ group.get('memory_load_error') }}</p>
+                {% endif %}
+                {% if group_memories %}
+                <div class="memory-list">
+                  {% for memory in group_memories %}
+                  <article class="memory-card {% if memory.get('is_inactive') %}memory-inactive{% endif %}">
+                    <div class="memory-heading">
+                      <div class="memory-badges">
+                        <span class="badge">{{ memory.get('memory_type_label') or '事实' }}</span>
+                        <span class="badge {% if memory.get('is_inactive') %}badge-danger{% elif memory.get('is_confirmed') %}badge-success{% endif %}">{{ memory.get('status_label') or '未知状态' }}</span>
+                        {% if memory.get('is_confirmed') and memory.get('status') != 'confirmed' %}<span class="badge badge-success">已人工确认</span>{% endif %}
+                        <span class="badge">置信：{{ memory.get('confidence_label') or '未知' }}</span>
+                      </div>
+                      <time>更新 {{ memory.get('updated_at') or '时间未知' }}</time>
+                    </div>
+                    <p class="memory-content">{{ memory.get('content') or '（未提供可显示内容）' }}</p>
+                    {% if memory.get('temporal_status') or memory.get('valid_from') or memory.get('valid_until') %}
+                    <p class="memory-validity">
+                      {% if memory.get('temporal_status') %}时态：{{ memory.get('temporal_status') }}{% endif %}
+                      {% if memory.get('valid_from') %} · 自 {{ memory.get('valid_from') }}{% endif %}
+                      {% if memory.get('valid_until') %} · 至 {{ memory.get('valid_until') }}{% endif %}
+                    </p>
+                    {% endif %}
+                    <details class="memory-evidence">
+                      <summary>查看来源证据（{{ memory.get('evidence_items')|length }} 条）</summary>
+                      {% if memory.get('evidence_items') %}
+                      <div class="memory-evidence-list">
+                        {% for evidence in memory.get('evidence_items') %}
+                        <article>
+                          <div class="memory-evidence-meta">
+                            {% if evidence.get('message_id') %}<code>消息 {{ evidence.get('message_id') }}</code>{% endif %}
+                            {% if evidence.get('sender') %}<span>{{ evidence.get('sender') }}</span>{% endif %}
+                            {% if evidence.get('created_at') %}<time>{{ evidence.get('created_at') }}</time>{% endif %}
+                          </div>
+                          {% if evidence.get('quote') %}<blockquote>{{ evidence.get('quote') }}</blockquote>{% else %}<p class="muted">只保留了可追溯的来源消息 ID。</p>{% endif %}
+                        </article>
+                        {% endfor %}
+                      </div>
+                      {% else %}
+                      <p class="memory-no-evidence">这条记录当前没有可显示证据；在补足来源前不应把它当作已核实事实。</p>
+                      {% endif %}
+                    </details>
+
+                    {% if memory.get('memory_id') and group.get('memory_feature_available') %}
+                    <div class="memory-actions">
+                      {% if not memory.get('is_confirmed') and not memory.get('is_inactive') %}
+                      <form method="post" action="{{ url_for('moderate_group_memory', group_id=group_id, memory_id=memory.get('memory_id')) }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="action" value="confirm">
+                        <input type="hidden" name="note" value="管理员在本机控制台确认">
+                        <button class="button button-secondary" type="submit">确认准确</button>
+                      </form>
+                      {% endif %}
+                      <details class="memory-edit">
+                        <summary>更正、撤回或软删除</summary>
+                        <form method="post" action="{{ url_for('moderate_group_memory', group_id=group_id, memory_id=memory.get('memory_id')) }}">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <label>
+                            <span>操作</span>
+                            <select name="action" required>
+                              <option value="correct">更正为新事实（保留旧版本）</option>
+                              <option value="retract">撤回：已知这条记忆不再成立</option>
+                              <option value="delete">软删除：隐藏使用但保留审计</option>
+                            </select>
+                          </label>
+                          <label>
+                            <span>更正后的完整事实</span>
+                            <textarea name="replacement_text" rows="3" maxlength="20000" placeholder="选择“更正”时必填；请写完整、无歧义的新事实。"></textarea>
+                          </label>
+                          <label>
+                            <span>原因 / 备注</span>
+                            <input name="note" type="text" maxlength="2000" placeholder="建议说明依据；会保留在本地审计中。">
+                          </label>
+                          <small>“删除”不会物理抹去记录，而是软撤回，避免 AI 失去更正历史和证据链。</small>
+                          <div class="form-actions"><button class="button button-danger" type="submit">应用记忆操作</button></div>
+                        </form>
+                      </details>
+                    </div>
+                    {% endif %}
+                  </article>
+                  {% endfor %}
+                </div>
+                {% elif group.get('memory_feature_available') %}
+                  <div class="empty-state compact"><p>这个群还没有长期记忆。AI 只有在原消息证据足够且核验通过时才会新增记忆。</p></div>
+                {% endif %}
+              </div>
+            </details>
+            <form class="group-reset-form" method="post" action="/groups/{{ group_id }}/reset-memory" onsubmit="return confirm('确定清空这个会话的全部长期记忆、历史摘要和群级规则，并重新计算全部已保存消息吗？原始消息和工具审计会保留，旧的 QQ 操作不会重放。');">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="confirm_reset" value="reset">
+              <button class="text-button text-button-danger" type="submit">清空本群记忆与规则并重算历史</button>
+              <small class="muted">会删除本群派生记忆、历史摘要和群级补充提示词；全局 rules.md 不受影响。</small>
+            </form>
+            <form class="group-form" method="post" action="/groups/{{ group_id }}/toggle">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="enabled" value="{% if is_enabled %}false{% else %}true{% endif %}">
+              <label>
+                <span>{% if is_private %}私聊{% else %}群级{% endif %}补充提示词</span>
+                <textarea name="prompt_override" rows="3" placeholder="可选：仅对这个会话生效">{{ group.get('prompt_override') or '' }}</textarea>
+              </label>
+              <label>
+                <span>群级思考深度</span>
+                <select name="reasoning_effort">
+                  {% set current_effort = group.get('reasoning_effort') or 'inherit' %}
+                  <option value="inherit" {% if current_effort == 'inherit' %}selected{% endif %}>继承全局设置</option>
+                  <option value="off" {% if current_effort == 'off' %}selected{% endif %}>关闭透传</option>
+                  <option value="minimal" {% if current_effort == 'minimal' %}selected{% endif %}>minimal</option>
+                  <option value="low" {% if current_effort == 'low' %}selected{% endif %}>low</option>
+                  <option value="medium" {% if current_effort == 'medium' %}selected{% endif %}>medium</option>
+                  <option value="high" {% if current_effort == 'high' %}selected{% endif %}>high</option>
+                  <option value="xhigh" {% if current_effort == 'xhigh' %}selected{% endif %}>xhigh</option>
+                </select>
+              </label>
+              <div class="form-actions">
+                {% if is_enabled %}
+                  <button class="button button-danger" type="submit">停止监听</button>
+                {% else %}
+                  <button class="button" type="submit">启用并开始监听</button>
+                {% endif %}
+              </div>
+            </form>
+            <form class="retry-form" method="post" action="/groups/{{ group_id }}/retry">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="text-button" type="submit" {% if not is_enabled %}disabled{% endif %}>重新尝试处理积压</button>
+            </form>
+          </article>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state">
+          <strong>尚未发现群</strong>
+          <p>启动 QQNT/NapCat 并配置反向 WebSocket 后，此处会显示已发现的群和收到过消息的私聊。所有会话默认关闭，需手动启用监听。</p>
+        </div>
+        {% endif %}
+      </section>
+
+      <section class="panel settings-panel" aria-labelledby="settings-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">本机配置</p>
+            <h2 id="settings-title">模型与连接</h2>
+          </div>
+        </div>
+        <form class="settings-form" method="post" action="/settings" autocomplete="off">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <fieldset>
+            <legend>OpenAI 兼容 API</legend>
+            {% set endpoint_mode = app_settings.get('llm_endpoint_mode') or 'completions' %}
+            <label>
+              <span>请求端点模式</span>
+              <select id="llm-endpoint-mode" name="llm_endpoint_mode">
+                <option value="base" {% if endpoint_mode == 'base' %}selected{% endif %}>base（按填写的完整 URL 请求）</option>
+                <option value="completions" {% if endpoint_mode == 'completions' %}selected{% endif %}>completions（/chat/completions）</option>
+                <option value="responses" {% if endpoint_mode == 'responses' %}selected{% endif %}>responses（/responses）</option>
+              </select>
+              <small id="llm-endpoint-mode-help">
+                {% if endpoint_mode == 'base' %}
+                  直接向下方填写的完整 URL 发起请求，使用 Chat Completions 兼容请求体。
+                {% elif endpoint_mode == 'responses' %}
+                  将在 Base URL 后使用 <code>/responses</code>，并采用 OpenAI Responses 请求格式。
+                {% else %}
+                  将在 Base URL 后使用 <code>/chat/completions</code>，保持 OpenAI Chat Completions 兼容格式。
+                {% endif %}
+              </small>
+            </label>
+            <label>
+              <span id="llm-base-url-label">{% if endpoint_mode == 'base' %}完整请求 URL{% else %}Base URL{% endif %}</span>
+              <input id="llm-base-url" name="llm_base_url" type="url" inputmode="url" value="{{ app_settings.get('llm_base_url') or '' }}" placeholder="{% if endpoint_mode == 'base' %}https://api.example.com/v1/chat/completions{% else %}https://api.example.com/v1{% endif %}" required>
+              <small id="llm-base-url-help">
+                {% if endpoint_mode == 'base' %}
+                  填写供应商提供的完整请求地址，例如 <code>https://api.example.com/v1/chat/completions</code>；服务不会再追加路径。
+                {% elif endpoint_mode == 'responses' %}
+                  填写 API 根地址，例如 <code>https://api.openai.com/v1</code>；服务会请求其 <code>/responses</code> 路径。
+                {% else %}
+                  填写 API 根地址，例如 <code>https://api.openai.com/v1</code>；服务会请求其 <code>/chat/completions</code> 路径。
+                {% endif %}
+              </small>
+            </label>
+            <label>
+              <span>模型名称</span>
+              <input name="llm_model" type="text" value="{{ app_settings.get('llm_model') or '' }}" placeholder="gpt-5-mini" required>
+            </label>
+            <label>
+              <span>图片生成模型</span>
+              <input name="image_model" type="text" value="{{ app_settings.get('image_model') or 'gemini-3.1-flash-image' }}" placeholder="gemini-3.1-flash-image" required>
+              <small>仅用于 Builtin_image_generation，不会替换上面的聊天模型。</small>
+            </label>
+            <label>
+              <span>请求超时（秒）</span>
+              <input name="timeout_seconds" type="number" min="5" max="600" step="1" value="{{ app_settings.get('timeout_seconds', 120) }}" required>
+              <small>单次模型 API 请求的最长等待时间；网络慢或长上下文可适当调高。</small>
+            </label>
+            <label>
+              <span>API Key</span>
+              <input name="llm_api_key" type="password" placeholder="留空以保留当前密钥" autocomplete="new-password">
+              <small>已保存的密钥以明文保存在 <code>data\api-key.json</code>，永不在此显示。</small>
+            </label>
+          </fieldset>
+
+          <fieldset>
+            <legend>推理与视觉</legend>
+            <label class="check-row">
+              <input name="send_reasoning_effort" type="checkbox" value="true" {% if app_settings.get('send_reasoning_effort') %}checked{% endif %}>
+              <span>向 API 透传思考深度</span>
+            </label>
+            <label>
+              <span>全局思考深度</span>
+              {% set global_effort = app_settings.get('global_reasoning_effort') or 'off' %}
+              <select name="global_reasoning_effort">
+                <option value="off" {% if global_effort == 'off' %}selected{% endif %}>关闭（省略字段）</option>
+                <option value="minimal" {% if global_effort == 'minimal' %}selected{% endif %}>minimal</option>
+                <option value="low" {% if global_effort == 'low' %}selected{% endif %}>low</option>
+                <option value="medium" {% if global_effort == 'medium' %}selected{% endif %}>medium</option>
+                <option value="high" {% if global_effort == 'high' %}selected{% endif %}>high</option>
+                <option value="xhigh" {% if global_effort == 'xhigh' %}selected{% endif %}>xhigh</option>
+              </select>
+              <small>Chat Completions 使用 <code>reasoning_effort</code>；Responses 使用 <code>reasoning.effort</code>。若供应商不支持，服务会自动降级一次并记录告警。</small>
+            </label>
+            <label class="check-row">
+              <input name="vision_enabled" type="checkbox" value="true" {% if app_settings.get('vision_enabled') %}checked{% endif %}>
+              <span>允许发送群图片给视觉模型</span>
+            </label>
+          </fieldset>
+
+          <fieldset>
+            <legend>提示词与本地存储</legend>
+            <label>
+              <span>全局提示词</span>
+              <textarea name="global_prompt" rows="8" placeholder="说明机器人应如何理解和总结群聊">{{ app_settings.get('global_prompt') or '' }}</textarea>
+              <small>安全边界由服务端固定注入；群聊原文不能改写工具权限。</small>
+            </label>
+            <label>
+              <span>媒体空间上限（GiB）</span>
+              <input name="media_budget_gib" type="number" min="1" max="1024" step="1" value="{{ app_settings.get('media_budget_gib', 20) }}" required>
+              <small>到达上限后自动淘汰最旧原图，消息记录和摘要仍会保留。</small>
+            </label>
+          </fieldset>
+
+          <fieldset>
+            <legend>NapCat 反向 WebSocket</legend>
+            <label>
+              <span>OneBot Token</span>
+              <input name="onebot_token" type="password" placeholder="留空以保留当前 Token" autocomplete="new-password">
+              <small>与 NapCat 反向 WS 客户端中的 token 完全一致；保存于 Windows 凭据管理器且永不回显。</small>
+            </label>
+          </fieldset>
+
+          <div class="form-actions">
+            <button class="button" type="submit">保存本机配置</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <section class="activity-grid" aria-label="运行记录">
+      <section class="panel activity-panel" aria-labelledby="events-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">采集记录</p>
+            <h2 id="events-title">最近事件</h2>
+          </div>
+        </div>
+        {% if recent_events %}
+        <div class="timeline">
+          {% for event in recent_events %}
+          <article class="timeline-item">
+            <div class="timeline-dot" aria-hidden="true"></div>
+            <div>
+              <div class="timeline-title"><strong>{{ event.get('group_name') or event.get('group_id') or '未知群' }}</strong><span>{{ event.get('created_at') or event.get('time') or '' }}</span></div>
+              <p>{{ event.get('summary') or event.get('normalized_text') or event.get('content') or event.get('event_type') or '已收到事件' }}</p>
+              <small>{{ event.get('event_type') or 'message' }}{% if event.get('processed') or not event.get('pending', true) %} · 已处理{% endif %}</small>
+            </div>
+          </article>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state compact"><p>暂无采集事件。</p></div>
+        {% endif %}
+      </section>
+
+      <section class="panel activity-panel" aria-labelledby="turns-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">模型记录</p>
+            <h2 id="turns-title">最近处理记录</h2>
+          </div>
+          <span class="muted">每条是当时的处理快照；最新约 50K 原文不立即压缩</span>
+        </div>
+        {% if recent_turns %}
+        <div class="turn-list">
+          {% for turn in recent_turns %}
+          <article class="turn-card">
+            <div class="timeline-title"><strong>{{ turn.get('group_name') or turn.get('group_id') or '未知群' }}</strong><span>{{ turn.get('finished_at') or turn.get('started_at') or turn.get('created_at') or '' }}</span></div>
+            {% if turn.get('summary') or turn.get('summary_text') or turn.get('content') %}
+              <p>{{ turn.get('summary') or turn.get('summary_text') or turn.get('content') }}</p>
+            {% elif not turn.get('error') %}
+              <p>未返回摘要</p>
+            {% endif %}
+            {% if turn.get('error') %}
+              <section class="turn-diagnostic {% if turn.get('status') == 'failed' %}turn-diagnostic-failed{% endif %}" aria-label="模型处理详情">
+                <strong>{% if turn.get('status') == 'failed' %}处理失败详情{% else %}处理告警详情{% endif %}</strong>
+                <pre>{{ turn.get('error') }}</pre>
+              </section>
+            {% endif %}
+            <small>{{ turn.get('status') or 'unknown' }} · {{ turn.get('model') or '模型未记录' }}{% if turn.get('reasoning_effort') %} · {{ turn.get('reasoning_effort') }}{% endif %}</small>
+          </article>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state compact"><p>暂无模型摘要。</p></div>
+        {% endif %}
+      </section>
+
+      <section class="panel activity-panel" aria-labelledby="audits-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">受限操作</p>
+            <h2 id="audits-title">工具审计</h2>
+          </div>
+        </div>
+        {% if audits %}
+        <div class="audit-list">
+          {% for audit in audits %}
+          <article class="audit-row">
+            <span class="badge {% if audit.get('success') or audit.get('status') == 'success' %}badge-success{% else %}badge-danger{% endif %}">{{ audit.get('tool_name') or audit.get('action') or '工具' }}</span>
+            <div>
+              <div class="audit-heading">
+                <strong>{{ audit.get('group_name') or audit.get('group_id') or '未知会话' }}</strong>
+                {% if audit.get('status') %}<span class="audit-status">{{ audit.get('status') }}</span>{% endif %}
+              </div>
+              <details class="audit-details" open>
+                <summary>工具返回给 AI 的结果</summary>
+                <pre>{{ audit.get('result_text') or audit.get('detail') or audit.get('result') or audit.get('result_json') or '工具没有返回内容' }}</pre>
+              </details>
+              {% if audit.get('arguments_text') or audit.get('arguments_json') %}
+              <details class="audit-details">
+                <summary>发送给工具的参数</summary>
+                <pre>{{ audit.get('arguments_text') or audit.get('arguments_json') }}</pre>
+              </details>
+              {% endif %}
+              {% if audit.get('tool_call_id') or audit.get('message_id') or audit.get('turn_id') %}
+              <div class="audit-identifiers">
+                {% if audit.get('turn_id') %}<span>turn {{ audit.get('turn_id') }}</span>{% endif %}
+                {% if audit.get('tool_call_id') %}<span>call {{ audit.get('tool_call_id') }}</span>{% endif %}
+                {% if audit.get('message_id') %}<span>message {{ audit.get('message_id') }}</span>{% endif %}
+              </div>
+              {% endif %}
+            </div>
+            <time>{{ audit.get('created_at') or '' }}</time>
+          </article>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state compact"><p>模型尚未执行工具调用。</p></div>
+        {% endif %}
+      </section>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>QQ 群 AI 代理在本机运行。不要将本页暴露到公网。</span>
+    <a href="https://napneko.github.io/config/basic" target="_blank" rel="noopener noreferrer">NapCat 配置文档</a>
+  </footer>
+
+  <script>
+    (() => {
+      const refreshButton = document.getElementById('refresh-page');
+      refreshButton?.addEventListener('click', () => window.location.reload());
+
+      const endpointMode = document.getElementById('llm-endpoint-mode');
+      const baseUrlLabel = document.getElementById('llm-base-url-label');
+      const baseUrl = document.getElementById('llm-base-url');
+      const endpointModeHelp = document.getElementById('llm-endpoint-mode-help');
+      const baseUrlHelp = document.getElementById('llm-base-url-help');
+      const endpointCopy = {
+        base: {
+          label: '完整请求 URL',
+          placeholder: 'https://api.example.com/v1/chat/completions',
+          modeHelp: '直接向下方填写的完整 URL 发起请求，使用 Chat Completions 兼容请求体。',
+          urlHelp: '填写供应商提供的完整请求地址，例如 https://api.example.com/v1/chat/completions；服务不会再追加路径。',
+        },
+        completions: {
+          label: 'Base URL',
+          placeholder: 'https://api.example.com/v1',
+          modeHelp: '将在 Base URL 后使用 /chat/completions，保持 OpenAI Chat Completions 兼容格式。',
+          urlHelp: '填写 API 根地址，例如 https://api.openai.com/v1；服务会请求其 /chat/completions 路径。',
+        },
+        responses: {
+          label: 'Base URL',
+          placeholder: 'https://api.example.com/v1',
+          modeHelp: '将在 Base URL 后使用 /responses，并采用 OpenAI Responses 请求格式。',
+          urlHelp: '填写 API 根地址，例如 https://api.openai.com/v1；服务会请求其 /responses 路径。',
+        },
+      };
+      const refreshEndpointCopy = () => {
+        const copy = endpointCopy[endpointMode?.value] || endpointCopy.completions;
+        if (baseUrlLabel) baseUrlLabel.textContent = copy.label;
+        if (baseUrl) baseUrl.placeholder = copy.placeholder;
+        if (endpointModeHelp) endpointModeHelp.textContent = copy.modeHelp;
+        if (baseUrlHelp) baseUrlHelp.textContent = copy.urlHelp;
+      };
+      endpointMode?.addEventListener('change', refreshEndpointCopy);
+      refreshEndpointCopy();
+
+      window.setInterval(() => {
+        const active = document.activeElement;
+        const editing = active && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName);
+        if (!editing) window.location.reload();
+      }, 30000);
+    })();
+  </script>
+</body>
+</html>

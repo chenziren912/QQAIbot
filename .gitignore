@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.tmp-render/
+.venv/
+data/
+data/api-key.json
+data/bilibili-cookies.txt
+api-key.json
+*.sqlite3
+*.db
+.env

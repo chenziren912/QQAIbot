@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qq-ai-group-agent"
+version = "0.1.0"
+description = "A local QQ/NapCat group summarizer and AI agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110,<0.116",
+  "uvicorn[standard]>=0.27,<0.35",
+  "httpx>=0.27,<0.29",
+  "jinja2>=3.1,<4",
+  "keyring>=24,<26",
+  "python-multipart>=0.0.9,<0.1",
+  "pypdf>=4,<7",
+  "PyMuPDF>=1.23,<1.27",
+  "yt-dlp[default]>=2025.1,<2027",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.23,<0.26",
+]
+
+[project.scripts]
+qq-ai-bot = "app.main:run"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.setuptools.package-data]
+app = ["templates/*.html", "static/*.css"]
