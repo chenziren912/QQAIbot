@@ -402,7 +402,3 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1
 ## 贡献
 
 欢迎提交 Issue 和 Pull Request。建议在提交前运行完整测试，并在报告中附上脱敏后的服务日志、操作系统、Python/NapCat/QQNT 版本和使用的端点模式；不要粘贴 Token、API Key、cookies、群聊原文或临时 QQ 文件 URL。
-
-## 许可证
-
-本仓库当前未附带许可证。若要公开分发，请在发布前根据你的需求添加 MIT、Apache-2.0 或其他合适的许可证文件，并确认第三方依赖和 NapCat/QQNT 的使用规则。
