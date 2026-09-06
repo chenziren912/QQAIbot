@@ -225,6 +225,66 @@ async def test_blank_recovery_response_keeps_agent_loop_alive(mode: str) -> None
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["completions", "responses"])
+async def test_execute_command_can_continue_past_ordinary_agent_caps(mode: str) -> None:
+    """Local command diagnostics are not truncated at 16 calls/4 rounds."""
+
+    command_count = 18
+    script = [
+        _tool_decision(
+            mode,
+            [("command-%s" % index, "execute_command", {"command": "echo %s" % index})],
+        )
+        for index in range(command_count)
+    ]
+    script.append(_text_decision(mode, "已完成全部命令检查。"))
+    client = ScriptedClient(mode, script)
+    executions: list[str] = []
+
+    async def execute(name: str, arguments: dict[str, Any], __: str, ___: int) -> dict[str, Any]:
+        assert name == "execute_command"
+        executions.append(arguments["command"])
+        return {"ok": True, "output": "ok"}
+
+    result = await client.run_turn("旧摘要", "继续执行诊断", "", "off", [], execute)
+
+    assert result.summary == "已完成全部命令检查。"
+    assert executions == ["echo %s" % index for index in range(command_count)]
+    assert len(client.requests) == command_count + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["completions", "responses"])
+async def test_command_mode_stays_unlimited_when_interleaving_file_tools(mode: str) -> None:
+    """A shell chain may inspect files between commands without hitting round caps."""
+
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+    for index in range(8):
+        calls.append(("command-%s" % index, "execute_command", {"command": "echo %s" % index}))
+        if index < 7:
+            calls.append(("files-%s" % index, "list_workspace_files", {"path": "."}))
+    client = ScriptedClient(
+        mode,
+        [_tool_decision(mode, [call]) for call in calls]
+        + [_text_decision(mode, "已完成命令与文件交叉检查。")],
+    )
+    executions: list[str] = []
+
+    async def execute(name: str, arguments: dict[str, Any], __: str, ___: int) -> dict[str, Any]:
+        executions.append(name)
+        if name == "execute_command":
+            return {"ok": True, "output": arguments["command"]}
+        assert name == "list_workspace_files"
+        return {"ok": True, "files": []}
+
+    result = await client.run_turn("旧摘要", "继续执行交叉诊断", "", "off", [], execute)
+
+    assert result.summary == "已完成命令与文件交叉检查。"
+    assert executions == [call[1] for call in calls]
+    assert len(client.requests) == len(calls) + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["completions", "responses"])
 async def test_empty_final_answer_keeps_repairing_until_agent_returns_text(mode: str) -> None:
     """An empty finalization must not strand a successful tool task."""
 
@@ -322,7 +382,7 @@ async def test_workspace_nonzero_command_returns_full_recoverable_diagnostic(tmp
 
 
 @pytest.mark.asyncio
-async def test_music_shell_search_is_routed_to_music_tool(tmp_path: Path, monkeypatch) -> None:
+async def test_shell_download_commands_are_allowed(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("QQ_AI_WORKSPACE_ROOT", str(tmp_path / "Workspace"))
     service = AgentService(tmp_path / "data")
     service.db.upsert_group("123", "测试群")
@@ -332,34 +392,70 @@ async def test_music_shell_search_is_routed_to_music_tool(tmp_path: Path, monkey
         turn_id,
         "123",
         "execute_command",
-        {"command": 'yt-dlp "bilisearch3:Alan Walker Alone" -x --audio-format mp3'},
-        "music-shell",
+        {"command": "python -c \"print('download command allowed')\""},
+        "shell-command",
+    )
+
+    assert result["ok"] is True
+    assert "download command allowed" in result["output"]
+    assert "retry_safe" not in result
+    await service.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "shutdown.exe /s /t 0",
+        "powershell -NoProfile -Command \"Restart-Computer -Force\"",
+        "systemctl reboot",
+        "loginctl poweroff",
+        "init 6",
+        "rundll32.exe powrprof.dll,SetSuspendState 0,1,0",
+    ],
+)
+async def test_power_state_commands_are_hard_blocked(tmp_path: Path, monkeypatch, command: str) -> None:
+    monkeypatch.setenv("QQ_AI_WORKSPACE_ROOT", str(tmp_path / "Workspace"))
+    service = AgentService(tmp_path / "data")
+    service.db.upsert_group("123", "测试群")
+    turn_id = service.db.create_turn("123", [])
+
+    result = await service._execute_tool(
+        turn_id,
+        "123",
+        "execute_command",
+        {"command": command},
+        "power-command",
     )
 
     assert result["ok"] is False
-    assert result["retry_safe"] is True
-    assert result["required_tool"] == "Builtin_music_download"
+    assert result["blocked"] is True
+    assert result["power_command_blocked"] is True
+    assert result["agent_continue"] is False
+    assert result["retry_safe"] is False
     assert "未执行" in result["error"]
     await service.stop()
 
 
 @pytest.mark.asyncio
-async def test_youtube_shell_search_is_routed_to_youtube_tool(tmp_path: Path, monkeypatch) -> None:
+async def test_encoded_powershell_power_command_is_hard_blocked(tmp_path: Path, monkeypatch) -> None:
+    import base64
+
     monkeypatch.setenv("QQ_AI_WORKSPACE_ROOT", str(tmp_path / "Workspace"))
     service = AgentService(tmp_path / "data")
     service.db.upsert_group("123", "测试群")
     turn_id = service.db.create_turn("123", [])
+    encoded = base64.b64encode("Stop-Computer -Force".encode("utf-16-le")).decode("ascii")
 
     result = await service._execute_tool(
         turn_id,
         "123",
         "execute_command",
-        {"command": 'yt-dlp "ytsearch1:Sharks official MV 144p" -f "bv*[height<=144]+ba"'},
-        "youtube-shell",
+        {"command": f"powershell -NoProfile -EncodedCommand {encoded}"},
+        "encoded-power-command",
     )
 
     assert result["ok"] is False
-    assert result["retry_safe"] is True
-    assert result["required_tool"] == "Builtin_youtube_download"
-    assert "未执行" in result["error"]
+    assert result["power_command_blocked"] is True
+    assert "编码 PowerShell" in result["error"]
     await service.stop()

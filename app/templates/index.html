@@ -101,6 +101,11 @@
         <span class="metric-detail">同一群按时间顺序串行处理</span>
       </article>
       <article class="metric-card">
+        <span class="metric-label">Flow 视频任务</span>
+        <strong class="metric-value">{{ app_state.get('flow_video_pending_count', 0) }}</strong>
+        <span class="metric-detail">后台异步轮询，完成后自动发送</span>
+      </article>
+      <article class="metric-card">
         <span class="metric-label">媒体存储</span>
         <strong class="metric-value">{{ app_state.get('media_usage_label') or '0 B' }}</strong>
         <span class="metric-detail">预算 {{ app_settings.get('media_budget_gib', 20) }} GiB</span>
@@ -241,11 +246,11 @@
             {% endif %}
             {% if group.get('summary') %}
               <details class="rolling-summary">
-                <summary>当前累计历史摘要（仅维护早于最新 50K 原文的内容）</summary>
+                <summary>当前累计历史摘要（仅维护早于最新 150K 原文的内容）</summary>
                 <pre>{{ group.get('summary') }}</pre>
               </details>
             {% else %}
-              <p class="rolling-summary-empty">尚无需要归档的旧消息；最新约 50K 会话原文会直接提供给 AI。</p>
+              <p class="rolling-summary-empty">尚无需要归档的旧消息；最新约 150K 会话原文会直接提供给 AI。</p>
             {% endif %}
             {% set group_memories = group.get('memories') or [] %}
             <details class="group-memory" id="group-memory-{{ group_id }}">
@@ -503,6 +508,24 @@
             </label>
           </fieldset>
 
+          <fieldset>
+            <legend>Google Flow 异步视频</legend>
+            <label>
+              <span>Flow API 地址</span>
+              <input name="flow_video_api_url" type="url" inputmode="url" value="{{ app_settings.get('flow_video_api_url') or 'http://127.0.0.1:8787' }}" placeholder="http://127.0.0.1:8787">
+              <small>填写 Flow 线程提供的本机 OpenAI-compatible 视频 API 根地址；默认 <code>http://127.0.0.1:8787</code>。API Key 如有设置请通过环境变量 <code>FLOW_API_KEY</code> 提供。</small>
+            </label>
+            <label>
+              <span>任务轮询间隔（秒）</span>
+              <input name="flow_video_poll_seconds" type="number" min="2" max="60" step="1" value="{{ app_settings.get('flow_video_poll_seconds', 5) }}">
+              <small>视频任务在后台独立轮询，不会阻塞群聊；提交后按 Flow 配置等待（默认 20 分钟），超时会记录真实错误并按一次性恢复策略处理，完成后自动发送 QQ 视频卡片。</small>
+            </label>
+            <label class="check-row">
+              <input name="flow_video_auto_send" type="checkbox" value="true" {% if app_settings.get('flow_video_auto_send', true) %}checked{% endif %}>
+              <span>生成完成后自动发送视频</span>
+            </label>
+          </fieldset>
+
           <div class="form-actions">
             <button class="button" type="submit">保存本机配置</button>
           </div>
@@ -542,7 +565,7 @@
             <p class="eyebrow">模型记录</p>
             <h2 id="turns-title">最近处理记录</h2>
           </div>
-          <span class="muted">每条是当时的处理快照；最新约 50K 原文不立即压缩</span>
+          <span class="muted">每条是当时的处理快照；最新约 150K 原文不立即压缩</span>
         </div>
         {% if recent_turns %}
         <div class="turn-list">

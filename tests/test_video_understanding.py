@@ -51,7 +51,7 @@ def test_video_event_exposes_video_metadata() -> None:
 
 
 @pytest.mark.asyncio
-async def test_video_frames_are_split_at_300k_and_merged(tmp_path: Path, monkeypatch) -> None:
+async def test_video_frames_respect_300k_token_budget_and_merge(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("QQ_AI_WORKSPACE_ROOT", str(tmp_path / "Workspace"))
     service = AgentService(tmp_path / "data")
     service.db.upsert_group("123", "视频群")
@@ -70,7 +70,11 @@ async def test_video_frames_are_split_at_300k_and_merged(tmp_path: Path, monkeyp
     monkeypatch.setattr(
         service_module,
         "image_file_to_data_uri",
-        lambda path, mime=None: "data:image/jpeg;base64," + ("A" * 200_000),
+        # One frame is intentionally larger than half of the estimated
+        # single-turn budget, so three frames must not all be packed into one
+        # request after the 300K-token ceiling was raised from the old 300 KiB
+        # transport chunk.
+        lambda path, mime=None: "data:image/jpeg;base64," + ("A" * 1_300_000),
     )
     frame_calls = []
 

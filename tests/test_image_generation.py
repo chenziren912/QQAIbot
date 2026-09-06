@@ -131,3 +131,24 @@ async def test_search_and_patch_notice_but_history_lookup_does_not(
     ]
     assert notices == ["正在搜索网络资料，请稍等。", "正在访问网页并读取内容，请稍等。"]
     await service.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"data": {"b64_json": base64.b64encode(PNG).decode("ascii")}},
+        {"images": ["data:image/png;base64," + base64.b64encode(PNG).decode("ascii")]},
+        {"image": {"image_url": {"url": "data:image/png;base64," + base64.b64encode(PNG).decode("ascii")}}},
+    ],
+)
+async def test_store_generated_image_accepts_common_relay_response_shapes(
+    tmp_path: Path, payload: Dict[str, Any]
+) -> None:
+    service = AgentService(tmp_path / "data", secret_store=Secrets())
+    try:
+        stored = await service._store_generated_image(payload, prompt="测试图片")
+        assert stored.path.is_file()
+        assert stored.path.read_bytes() == PNG
+    finally:
+        await service.stop()

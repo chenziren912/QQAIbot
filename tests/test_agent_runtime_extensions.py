@@ -108,8 +108,8 @@ async def test_latest_raw_window_stays_verbatim_while_only_older_event_is_archiv
     service.db.upsert_group("100", "测试群")
     service.db.set_group_config("100", True)
     service.db.set_group_initialized("100", True)
-    old_id = service.db.insert_event(normalise_onebot_event(_message("old", "旧" * 30_000, 1)))
-    new_id = service.db.insert_event(normalise_onebot_event(_message("new", "新" * 30_000, 2)))
+    old_id = service.db.insert_event(normalise_onebot_event(_message("old", "旧" * 100_000, 1)))
+    new_id = service.db.insert_event(normalise_onebot_event(_message("new", "新" * 100_000, 2)))
     assert old_id and new_id
     try:
         await service._run_group_worker("100")

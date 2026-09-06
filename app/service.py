@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
@@ -22,6 +23,7 @@ import httpx
 
 from .config import AppSettings, SecretStore, VALID_LLM_ENDPOINT_MODES, migrate_legacy_global_prompt
 from .db import Database, json_loads
+from .flow_video import FlowVideoClient, FlowVideoError
 from .llm import AdminConversationClient, ChatCompletionsClient, redact_error_detail
 from .markdown_render import MarkdownRenderError, render_markdown_images
 from .media import MediaError, MediaStore, image_file_to_data_uri
@@ -46,14 +48,21 @@ from .workspace import (
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_EVENTS = 200
-MAX_EVENT_TEXT_CHARS = 50_000
+# A single event may be large (for example a pasted code block), so keep the
+# durable/rendered event ceiling aligned with the expanded raw window.
+MAX_EVENT_TEXT_CHARS = 150_000
 MAX_IMAGES_PER_TURN = 4
 MAX_QQ_TEXT_CHARS = 4_000
 # Keep a broad source range, then select from its newest end by exact rendered
-# character budget.  A 50K transcript can legitimately contain far more than
+# character budget.  A 150K transcript can legitimately contain far more than
 # ten one-character QQ messages.
 MAX_RAW_CONTEXT_SOURCE_EVENTS = 60_000
-MAX_RECENT_CONTEXT_CHARS = 50_000
+MAX_INITIAL_HISTORY_CHARS = 150_000
+MAX_RECENT_CONTEXT_CHARS = 150_000
+# Older content is folded into the rolling summary in bounded passes.  Keeping
+# each archival pass smaller than the raw window leaves room for the previous
+# summary, rules and the newest 150K transcript in one model request.
+MAX_ARCHIVE_BATCH_CHARS = 50_000
 MAX_MEMORY_EVENTS_PER_PASS = 80
 MAX_MEMORY_EXTRACTION_CHARS = 100_000
 MAX_MEMORY_CONTEXT_CHARS = 80_000
@@ -62,6 +71,20 @@ MAX_ADMIN_CHAT_MESSAGE_CHARS = 12_000
 MAX_ADMIN_HISTORY_FOR_MODEL = 40
 MAX_IMAGE_GENERATION_PROMPT_CHARS = 4_000
 MAX_MARKDOWN_RENDER_CHARS = 160_000
+# Flow video generation is deliberately pinned to the only model that the
+# QQ agent is allowed to request.  The companion browser API uses the same
+# canonical ID; the user-facing Flow menu may call it “Omni 1.1 Flash”.
+FLOW_VIDEO_MODEL = "gemini-omni-flash"
+FLOW_VIDEO_MODEL_ALIASES = frozenset(
+    {
+        FLOW_VIDEO_MODEL,
+        "gemini-omni-flash-1.1",
+        "gemini-omni-flash-1_1",
+        "gemini omni flash",
+        "omni-1.1-flash",
+        "omni 1.1 flash",
+    }
+)
 VALID_REASONING_EFFORTS = {"off", "minimal", "low", "medium", "high", "xhigh", "inherit"}
 PRIVATE_CONVERSATION_PREFIX = "private:"
 MAX_AUTO_SUMMARY_RECOVERY_ATTEMPTS = 1
@@ -109,6 +132,7 @@ TOOL_ACTIVITY_NOTICES = {
     "Builtin_music_download": "正在下载音乐并转换为 QQ 语音，请稍等。",
     "Builtin_video_understanding": "正在逐帧分析视频，请稍等。",
     "Builtin_pdf_understanding": "正在读取 PDF 页面，请稍等。",
+    "Builtin_video_generation_create": "正在提交视频生成任务，请稍等。",
 }
 
 # These tools do not send a requested result to QQ themselves.  A failure is a
@@ -120,6 +144,11 @@ TOOL_ACTIVITY_NOTICES = {
 _SAFE_FINALIZATION_NOTICE_TOOLS = {"Builtin_video_understanding"}
 
 MAX_COMMAND_OUTPUT_CHARS = 100_000
+# Command progress is a QQ-facing status line only.  The actual command and
+# complete stdout/stderr remain available to the Agent in the tool result.
+COMMAND_PROGRESS_PREVIEW_CHARS = 30
+COMMAND_PROGRESS_INITIAL_NOTICES = 3
+COMMAND_PROGRESS_REPORT_EVERY = 3
 MAX_BILIBILI_URL_CHARS = 2_000
 MAX_BILIBILI_DOWNLOAD_SECONDS = 600
 MAX_YOUTUBE_URL_CHARS = 2_000
@@ -135,14 +164,57 @@ QQ_AUDIO_EXTENSIONS = frozenset(
 )
 MAX_QQ_VOICE_SEGMENT_SECONDS = DEFAULT_VOICE_SEGMENT_SECONDS
 MAX_QQ_VOICE_SEGMENTS = 120
-_MUSIC_COMMAND_RE = re.compile(
-    r"(?:yt-dlp|youtube-dl)\b.*(?:\b(?:bilisearch|scsearch)\d*:|--audio-format|\s-x(?:\s|$)|\.mp3\b|\.m4a\b|\baudio\b)",
+# ``execute_command`` is intentionally unrestricted apart from one narrow
+# machine-safety boundary: commands that change the host power/session state.
+# Keep these patterns conservative about ordinary file names but broad enough
+# to cover cmd, PowerShell, systemd and common Windows API entry points.
+_POWER_COMMAND_PATTERNS = (
+    (re.compile(r"(?<![\w.-])(?:shutdown(?:\.exe)?|reboot|poweroff|halt|logoff(?:\.exe)?|tsdiscon(?:\.exe)?)(?![\w.-])", re.IGNORECASE), "关机、重启或注销命令"),
+    (re.compile(r"(?<![\w.-])(?:restart-computer|stop-computer|suspend-computer|hibernate-computer)(?![\w.-])", re.IGNORECASE), "PowerShell 电源状态命令"),
+    (re.compile(r"(?<![\w.-])systemctl\s+(?:\S+\s+)*(?:poweroff|reboot|halt|suspend|hibernate)(?![\w.-])", re.IGNORECASE), "systemctl 电源状态命令"),
+    (re.compile(r"(?<![\w.-])loginctl\s+(?:\S+\s+)*(?:poweroff|reboot|suspend|hibernate)(?![\w.-])", re.IGNORECASE), "loginctl 电源状态命令"),
+    (re.compile(r"(?<![\w.-])init\s+(?:0|6)(?!\w)", re.IGNORECASE), "init 电源状态命令"),
+    (re.compile(r"(?<![\w.-])(?:rundll32(?:\.exe)?\s+[^\r\n;|&]*powrprof\.dll\s*,\s*setsuspendstate|powercfg(?:\.exe)?\s+/(?:h|hibernate)\b)", re.IGNORECASE), "Windows 休眠或电源配置命令"),
+    (re.compile(r"(?<![\w.-])(?:exitwindowsex|initiatesystemshutdown(?:ex)?|set_suspend_state|setsuspendstate|setsystempowerstate|wtslogoffsession)(?![\w.-])", re.IGNORECASE), "Windows 电源/会话 API"),
+)
+_POWERSHELL_ENCODED_RE = re.compile(
+    r"(?:^|\s)(?:-encodedcommand|-enc)\s+(?:['\"])?([A-Za-z0-9+/=_-]+)(?:['\"])?(?=\s|$)",
     re.IGNORECASE,
 )
-_YOUTUBE_COMMAND_RE = re.compile(
-    r"(?:yt-dlp|youtube-dl)\b.*(?:youtube(?:-nocookie)?\.com|youtu\.be|\bytsearch\d*:)",
-    re.IGNORECASE,
-)
+
+
+def _power_state_change_reason(command: str, *, inspect_encoded: bool = True) -> str:
+    """Return a reason when *command* attempts to change host power/session state.
+
+    PowerShell's ``-EncodedCommand`` payload is UTF-16LE by convention.  Decode
+    it before scanning so a model cannot bypass the sole hard command boundary
+    by wrapping ``Restart-Computer`` in base64.  Decode failures are ignored;
+    the original command is still allowed to run unless it matches a direct
+    pattern, because malformed base64 is not itself a power operation.
+    """
+
+    text = str(command or "")
+    for pattern, reason in _POWER_COMMAND_PATTERNS:
+        if pattern.search(text):
+            return reason
+    if inspect_encoded:
+        for match in _POWERSHELL_ENCODED_RE.finditer(text):
+            encoded = match.group(1).replace("-", "+").replace("_", "/")
+            encoded += "=" * (-len(encoded) % 4)
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError, base64.binascii.Error):
+                continue
+            for encoding in ("utf-16-le", "utf-8", "utf-16"):
+                try:
+                    decoded = raw.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+                reason = _power_state_change_reason(decoded, inspect_encoded=False)
+                if reason:
+                    return "编码 PowerShell 内容包含" + reason
+                break
+    return ""
 BILIBILI_DOWNLOAD_ARGUMENTS = {
     "url",
     "format_selector",
@@ -163,7 +235,16 @@ HISTORY_ACTION_TIMEOUT_SECONDS = 20
 ONEBOT_FILE_SOURCE_TIMEOUT_SECONDS = 20
 MAX_WORKSPACE_LIST_ITEMS = 500
 MAX_VIDEO_FILE_BYTES = 2 * 1024 * 1024 * 1024
-VIDEO_FRAME_CHUNK_BYTES = 300 * 1024
+# Vision providers account image URLs differently from plain text.  Keep a
+# conservative, explicit estimate (roughly four UTF-8/base64 characters per
+# token) and reserve room for the instruction/user text so one visual request
+# never intentionally exceeds the requested 300K-token single-turn ceiling.
+VIDEO_FRAME_MAX_INPUT_TOKENS = 300_000
+VIDEO_FRAME_INPUT_RESERVE_TOKENS = 2_000
+VIDEO_FRAME_TOKEN_CHARS_ESTIMATE = 4
+VIDEO_FRAME_CHUNK_BYTES = (
+    VIDEO_FRAME_MAX_INPUT_TOKENS - VIDEO_FRAME_INPUT_RESERVE_TOKENS
+) * VIDEO_FRAME_TOKEN_CHARS_ESTIMATE
 
 # A newly arrived message must not wait behind a long-running primary Agent
 # turn just to learn that it was received.  The auxiliary reply is strictly a
@@ -211,7 +292,50 @@ _BUSY_TOOL_PROGRESS_LABELS = {
     "write_workspace_file": "整理文件",
     "execute_command": "执行当前任务所需命令",
     "send_group_file": "发送文件",
+    "Builtin_video_generation_create": "提交视频生成任务",
+    "Builtin_video_generation_list": "查询视频生成任务",
+    "Builtin_video_generation_result": "查询视频生成结果",
 }
+
+FLOW_VIDEO_TOOL_NAMES = frozenset(
+    {
+        "Builtin_video_generation_create",
+        "Builtin_video_generation_list",
+        "Builtin_video_generation_result",
+    }
+)
+FLOW_VIDEO_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+FLOW_VIDEO_MAX_PROMPT_CHARS = 4_000
+FLOW_VIDEO_MAX_MODEL_CHARS = 120
+FLOW_VIDEO_MAX_REFERENCE_CHARS = 8_000
+FLOW_VIDEO_MAX_TASKS_PER_CONVERSATION = 100
+FLOW_VIDEO_POLL_TIMEOUT_SECONDS = 45
+# The create endpoint is asynchronous, but older companion processes may
+# still perform a strict Flow readiness check before returning its job ID.
+# Give that handshake enough time without extending ordinary status/download
+# requests or the 20-minute browser generation deadline.
+FLOW_VIDEO_CREATE_TIMEOUT_SECONDS = 180
+# A Flow browser wait can time out even when the remote job was accepted.  A
+# single durable retry is useful for this very specific post-submit timeout,
+# but repeating it indefinitely would spend credits and could duplicate a
+# video.  Other errors (auth, policy, credits, unknown task state) stay
+# terminal and are handed to the Agent instead.
+FLOW_VIDEO_AUTO_RETRY_LIMIT = 1
+FLOW_VIDEO_FAILURE_EVENT_TYPE = "service.flow_video_failure"
+FLOW_VIDEO_FAILURE_DEDUPE_PREFIX = "service:flow-video-failure:"
+FLOW_VIDEO_FAILURE_NOTICE_RETRY_DELAYS = (0.0, 1.0, 3.0, 8.0)
+# Match the configured Flow wait ceiling rather than only the retired 900s
+# message.  This remains limited to a post-submit "waiting for Flow" timeout.
+FLOW_VIDEO_TIMEOUT_PATTERN = re.compile(
+    r"timed\s+out\s+after\s+\d+\s+seconds\s+waiting\s+for\s+(?:google\s+)?flow",
+    re.IGNORECASE,
+)
+FLOW_VIDEO_TIMEOUT_MARKERS = (
+    "timed out after 900 seconds waiting for google flow",
+    "timed out after 900 seconds waiting for flow",
+    "google flow 等待超时",
+    "等待 google flow 超时",
+)
 
 
 def _file_info(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -493,6 +617,28 @@ def _as_string(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+def normalise_qq_plain_text(value: Any) -> str:
+    """Remove accidental Markdown emphasis markers from QQ plain text.
+
+    QQ text messages are not Markdown-rendered.  Some model responses
+    therefore leak ``**bold**`` delimiters into the group, as in the reported
+    screenshot.  Keep inline/fenced code untouched (asterisks can be
+    meaningful there), while making ordinary prose readable.  This is a
+    presentation cleanup only; it does not change the model's internal
+    summary or tool arguments.
+    """
+
+    text = _as_string(value)
+    if "**" not in text:
+        return text
+    # Split out fenced blocks and inline code spans.  Matched code spans are
+    # kept byte-for-byte so meaningful asterisks are never rewritten.
+    parts = re.split(r"(```[\s\S]*?```|`[^`\n]*`)", text)
+    for index in range(0, len(parts), 2):
+        parts[index] = parts[index].replace("**", "")
+    return "".join(parts)
+
+
 def _is_bilibili_url(value: str) -> bool:
     """Return whether *value* is an HTTP(S) URL served by Bilibili.
 
@@ -644,6 +790,40 @@ def _yt_dlp_js_runtime_args() -> List[str]:
     if node:
         return ["--js-runtimes", "node:" + str(node)]
     return []
+
+
+def _yt_dlp_authentication_warning(output: str, provider: str) -> str:
+    """Extract a safe login/cookie warning from yt-dlp output.
+
+    yt-dlp can finish a public download while warning that a cookie jar was
+    rotated or expired.  Returning that fact separately prevents the Agent
+    from treating an anonymous fallback as proof that the configured account
+    is healthy, without exposing cookie values or the raw provider page.
+    """
+
+    lowered = _as_string(output).casefold()
+    if "cookies are no longer valid" in lowered or "cookies ... no longer valid" in lowered:
+        return "%s 的 cookies 已失效或被轮换；本次文件可能是匿名访问结果。" % provider
+    if "sign in to confirm" in lowered or "sign in to confirm you" in lowered:
+        return "%s 要求重新登录或确认不是机器人；请更新运行数据目录中的 cookie 文件。" % provider
+    if "not logged in" in lowered or "login required" in lowered:
+        return "%s 当前未登录；请更新运行数据目录中的 cookie 文件。" % provider
+    return ""
+
+
+def _yt_dlp_result_metadata(output: str) -> Dict[str, str]:
+    """Parse only the explicit metadata lines requested from yt-dlp."""
+
+    result: Dict[str, str] = {}
+    prefixes = {"id": "id", "title": "title", "webpage_url": "url"}
+    for raw_line in _as_string(output).splitlines():
+        line = raw_line.strip()
+        for prefix, key in prefixes.items():
+            marker = prefix + ":"
+            if line.startswith(marker) and line[len(marker) :].strip():
+                result[key] = line[len(marker) :].strip()[:2_000]
+                break
+    return result
 
 
 def _structured_reply_target_message_ids(raw: Dict[str, Any]) -> List[str]:
@@ -1117,9 +1297,20 @@ class AgentService:
         # notices are useful once, but repeating the same notice for every
         # recovery round makes a stuck relay look like a bot flood.
         self._activity_notice_seen: Set[Tuple[int, str, str]] = set()
+        # Number of shell commands requested in each Agent turn.  This is
+        # intentionally ephemeral: it controls only progress-message cadence
+        # and never changes command execution or the full diagnostic returned
+        # to the model.  A bounded map avoids retaining old turn IDs forever.
+        self._command_activity_counts: Dict[Tuple[int, str], int] = {}
         self._busy_reply_event_ids: set[int] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._group_discovery_task: Optional[asyncio.Task[Any]] = None
+        self._flow_video_monitor_task: Optional[asyncio.Task[Any]] = None
+        self._flow_video_delivery_locks: Dict[str, asyncio.Lock] = {}
+        # Failure handling can be entered concurrently by the monitor and a
+        # member's explicit status query.  Serialize one terminal transition
+        # per job so a timeout never creates two replacement tasks.
+        self._flow_video_failure_locks: Dict[str, asyncio.Lock] = {}
         self._history_backfill_groups: set[str] = set()
         # A provider can return a refusal/error as ordinary text.  Allow one
         # automatic summary-only recomputation, then stop until the operator
@@ -1146,6 +1337,12 @@ class AgentService:
         stale_turns = self.db.cancel_running_turns("service restarted before the turn finished")
         if stale_turns:
             logger.warning("cancelled %s stale running turn(s) from a previous service process", stale_turns)
+        stale_flow_deliveries = self.db.recover_flow_video_sending_states()
+        if stale_flow_deliveries:
+            logger.warning(
+                "marked %s interrupted Flow video delivery(ies) unknown; no QQ replay",
+                stale_flow_deliveries,
+            )
         # Repair a corrupt legacy summary even when no new QQ event arrives;
         # the resulting archive-only worker recomputes the bounded interval.
         for group in self.db.list_groups():
@@ -1167,6 +1364,10 @@ class AgentService:
                 await self._schedule_worker(group_id)
         if self._group_discovery_task is None or self._group_discovery_task.done():
             self._group_discovery_task = self._track_background_task(self._group_discovery_loop())
+        if self._flow_video_monitor_task is None or self._flow_video_monitor_task.done():
+            self._flow_video_monitor_task = self._track_background_task(
+                self._flow_video_monitor_loop()
+            )
         if self.adapter and self.adapter.connected:
             await self.sync_groups()
 
@@ -1200,6 +1401,7 @@ class AgentService:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._workers.clear()
         self._worker_activity.clear()
+        self._command_activity_counts.clear()
         self._busy_reply_event_ids.clear()
         background_tasks = list(self._background_tasks)
         for task in background_tasks:
@@ -1208,6 +1410,9 @@ class AgentService:
             await asyncio.gather(*background_tasks, return_exceptions=True)
         self._background_tasks.clear()
         self._group_discovery_task = None
+        self._flow_video_monitor_task = None
+        self._flow_video_delivery_locks.clear()
+        self._flow_video_failure_locks.clear()
         if self.adapter:
             disconnect = getattr(self.adapter, "disconnect", None)
             if callable(disconnect):
@@ -1272,6 +1477,10 @@ class AgentService:
             "timeout_seconds": llm.timeout_seconds,
             "global_prompt": llm.global_prompt,
             "media_budget_gib": self.settings.media_budget_gib,
+            "flow_video_api_url": self.settings.flow_video_api_url,
+            "flow_video_poll_seconds": self.settings.flow_video_poll_seconds,
+            "flow_video_auto_send": self.settings.flow_video_auto_send,
+            "flow_video_api_key_configured": bool(os.environ.get("FLOW_API_KEY", "").strip()),
             "api_key_configured": bool(self.secret_store.get_llm_api_key()),
             "onebot_token_configured": bool(self.settings.onebot_token),
         }
@@ -1561,6 +1770,18 @@ class AgentService:
             self.settings.media_budget_gib = max(1, min(1024, int(values.get("media_budget_gib", self.settings.media_budget_gib))))
         except (TypeError, ValueError):
             pass
+        flow_url = _as_string(values.get("flow_video_api_url", self.settings.flow_video_api_url)).strip().rstrip("/")
+        self.settings.flow_video_api_url = flow_url or "http://127.0.0.1:8787"
+        try:
+            self.settings.flow_video_poll_seconds = max(
+                2, min(60, int(values.get("flow_video_poll_seconds", self.settings.flow_video_poll_seconds)))
+            )
+        except (TypeError, ValueError):
+            pass
+        # HTML checkboxes are absent when unchecked; the value is therefore
+        # explicitly replaced rather than merged with the old setting.
+        if "flow_video_auto_send" in values:
+            self.settings.flow_video_auto_send = bool(values.get("flow_video_auto_send"))
         self.media.set_budget_bytes(self.settings.media_budget_gib * 1024 ** 3)
 
         token_input = _as_string(values.get("onebot_token", "")).strip()
@@ -1797,11 +2018,11 @@ class AgentService:
             candidate.setdefault("message_type", "group")
             candidate.setdefault("group_id", group_id)
             size = len(normalise_onebot_event(candidate, history=True)["normalized_text"])
-            if selected and used + size > MAX_EVENT_TEXT_CHARS:
+            if selected and used + size > MAX_INITIAL_HISTORY_CHARS:
                 break
             selected.append(candidate)
-            used += min(size, MAX_EVENT_TEXT_CHARS)
-            if used >= MAX_EVENT_TEXT_CHARS:
+            used += min(size, MAX_INITIAL_HISTORY_CHARS)
+            if used >= MAX_INITIAL_HISTORY_CHARS:
                 break
         selected.reverse()
         return selected
@@ -1937,7 +2158,7 @@ class AgentService:
             "current_turn_event_count": min(MAX_HISTORY_EVENTS, len(event_ids)),
             "phase_elapsed_seconds": min(86_400, phase_elapsed),
             # This is a small current-turn preview, not the conversation's
-            # 50K raw context, old summary, rules, or any other session.
+            # 150K raw context, old summary, rules, or any other session.
             "current_turn_context": _as_string(activity.get("turn_context"))[
                 :MAX_BUSY_REPLY_TURN_CONTEXT_CHARS
             ],
@@ -2286,7 +2507,7 @@ class AgentService:
                 for event in raw_context_events
                 if int(event.get("id") or 0) > 0
             }
-            # The raw 50K transcript is never summarized in this round.  Only
+            # The raw 150K transcript is never summarized in this round.  Only
             # events that have naturally fallen out of it advance the rolling
             # summary cursor.  This is deliberately independent from pending:
             # a live message can be handled by the agent immediately while it
@@ -2450,7 +2671,7 @@ class AgentService:
                     recent_context=recent_context_text,
                 )
                 # Images are most relevant when they just arrived.  They stay
-                # visible as textual placeholders in the raw 50K transcript;
+                # visible as textual placeholders in the raw 150K transcript;
                 # re-uploading every old image on every turn would be both
                 # expensive and hostile to vision API limits.
                 self._set_worker_activity(
@@ -2642,7 +2863,7 @@ class AgentService:
 
     @classmethod
     def _select_latest_raw_context(cls, events: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Keep the newest verbatim transcript slice within the 50K budget.
+        """Keep the newest verbatim transcript slice within the 150K budget.
 
         Events arrive in chronological order.  Selecting backward matters:
         cutting a forward-formatted transcript would retain old context and
@@ -2671,11 +2892,11 @@ class AgentService:
         for event in events[:MAX_HISTORY_EVENTS]:
             text = _as_string(event.get("normalized_text"))
             size = len(text)
-            if selected and used + size > MAX_EVENT_TEXT_CHARS:
+            if selected and used + size > MAX_ARCHIVE_BATCH_CHARS:
                 break
             selected.append(event)
-            used += min(size, MAX_EVENT_TEXT_CHARS)
-            if used >= MAX_EVENT_TEXT_CHARS:
+            used += min(size, MAX_ARCHIVE_BATCH_CHARS)
+            if used >= MAX_ARCHIVE_BATCH_CHARS:
                 break
         return selected
 
@@ -3528,46 +3749,98 @@ class AgentService:
         *,
         prompt: str,
     ) -> Any:
-        """Persist the first standard Images API result before sending it."""
+        """Persist the first image result before sending it through OneBot.
 
-        rows = payload.get("data") if isinstance(payload, dict) else None
+        OpenAI-compatible relays are not perfectly uniform: most return
+        ``data[0].b64_json`` or ``data[0].url``, while a few return a single
+        object, ``images``, ``image_url`` or a data URI in a base64 field.  A
+        small normalisation layer keeps those variants from becoming the
+        misleading “image generation succeeded but nothing was sent” failure.
+        """
+
+        if not isinstance(payload, dict):
+            raise ValueError("图片生成接口返回的 JSON 顶层不是对象")
+        rows = payload.get("data")
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list) or not rows:
+            rows = payload.get("images")
+        if isinstance(rows, (str, bytes, bytearray)):
+            rows = [{"b64_json": rows}]
+        if isinstance(rows, list) and rows and isinstance(rows[0], (str, bytes, bytearray)):
+            rows = [{"url": item} for item in rows]
         if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
-            raise ValueError("图片生成接口未返回 data 图片数组")
+            # Some relays put a single image object under ``image``.  Accept it
+            # only when it is an object, never an arbitrary provider message.
+            single = payload.get("image")
+            if isinstance(single, dict):
+                rows = [single]
+            elif isinstance(single, (str, bytes, bytearray)):
+                rows = [{"url": single}]
+            else:
+                rows = []
+        if not rows and isinstance(payload.get("url"), (str, bytes, bytearray)):
+            rows = [{"url": payload.get("url")}]
+        if not rows or not isinstance(rows[0], dict):
+            raise ValueError("图片生成接口未返回可识别的图片结果（data/images/url/base64）")
         item = rows[0]
-        encoded = _as_string(item.get("b64_json") or item.get("base64"))
+        encoded_value = (
+            item.get("b64_json")
+            or item.get("base64")
+            or item.get("b64")
+            or item.get("base64_data")
+            or item.get("image_base64")
+        )
+        encoded = encoded_value if isinstance(encoded_value, (bytes, bytearray)) else _as_string(encoded_value)
         metadata = {"generated": True, "prompt": prompt[:MAX_IMAGE_GENERATION_PROMPT_CHARS]}
         if encoded:
-            if encoded.startswith("data:"):
-                marker = ";base64,"
-                if marker not in encoded:
+            content_type = _as_string(item.get("mime_type") or item.get("content_type")) or None
+            if isinstance(encoded, (bytes, bytearray)):
+                raw = bytes(encoded)
+            elif encoded.casefold().startswith("data:"):
+                header, marker, data = encoded.partition(",")
+                if not marker or ";base64" not in header.casefold():
                     raise ValueError("图片生成接口返回的 data URI 无效")
-                encoded = encoded.split(marker, 1)[1]
+                content_type = header[5:].split(";", 1)[0].strip() or content_type
+                encoded = data
+                try:
+                    raw = base64.b64decode(re.sub(r"\s+", "", encoded), validate=True)
+                except (ValueError, TypeError, base64.binascii.Error) as exc:
+                    raise ValueError("图片生成接口返回的 data URI 无效") from exc
             elif encoded.startswith("base64://"):
                 encoded = encoded[len("base64://") :]
-            try:
-                raw = base64.b64decode(encoded, validate=True)
-            except (ValueError, TypeError, base64.binascii.Error) as exc:
-                raise ValueError("图片生成接口返回的 base64 无效") from exc
+                try:
+                    raw = base64.b64decode(re.sub(r"\s+", "", encoded), validate=True)
+                except (ValueError, TypeError, base64.binascii.Error) as exc:
+                    raise ValueError("图片生成接口返回的 base64 无效") from exc
+            else:
+                try:
+                    raw = base64.b64decode(re.sub(r"\s+", "", encoded), validate=True)
+                except (ValueError, TypeError, base64.binascii.Error) as exc:
+                    raise ValueError("图片生成接口返回的 base64 无效") from exc
             return await asyncio.to_thread(
                 self.media.store_bytes,
                 raw,
-                content_type=_as_string(item.get("mime_type") or item.get("content_type")) or None,
+                content_type=content_type,
                 metadata=metadata,
             )
-        url = _as_string(item.get("url"))
+        url_value = item.get("url") or item.get("image_url")
+        if isinstance(url_value, dict):
+            url_value = url_value.get("url")
+        url = _as_string(url_value).strip()
         if url:
-            if url.startswith("data:"):
-                marker = ";base64,"
-                if marker not in url:
+            if url.casefold().startswith("data:"):
+                header, marker, data = url.partition(",")
+                if not marker or ";base64" not in header.casefold():
                     raise ValueError("图片生成接口返回的 data URI 无效")
                 try:
-                    raw = base64.b64decode(url.split(marker, 1)[1], validate=True)
+                    raw = base64.b64decode(re.sub(r"\s+", "", data), validate=True)
                 except (ValueError, TypeError, base64.binascii.Error) as exc:
                     raise ValueError("图片生成接口返回的 data URI 无效") from exc
                 return await asyncio.to_thread(
                     self.media.store_bytes,
                     raw,
-                    content_type=url.split(";", 1)[0][5:] or None,
+                    content_type=header[5:].split(";", 1)[0].strip() or None,
                     metadata=metadata,
                 )
             return await self.media.download_image(url, metadata=metadata)
@@ -4197,31 +4470,22 @@ class AgentService:
             command = _as_string(arguments.get("command")).strip()
             if not command:
                 return {"ok": False, "retry_safe": True, "error": "command 不能为空"}
-            if _MUSIC_COMMAND_RE.search(command):
+            power_reason = _power_state_change_reason(command)
+            if power_reason:
+                # This is the only command-level hard boundary.  Do not mark
+                # it retry-safe or agent-continue: the model must not retry or
+                # disguise a power operation through another shell wrapper.
                 return {
                     "ok": False,
-                    "retry_safe": True,
-                    "required_tool": "Builtin_music_download",
-                    "failure_kind": "wrong_tool_for_music_download",
+                    "blocked": True,
+                    "power_command_blocked": True,
+                    "retry_safe": False,
+                    "agent_continue": False,
+                    "failure_kind": "power_state_change_blocked",
+                    "workspace": str(self.conversation_workspace(conversation_id)),
                     "command": command,
-                    "error": (
-                        "检测到这是音乐搜索/下载命令；未执行。请改用 Builtin_music_download。"
-                        "有链接时传 url，没有链接时把歌名和歌手传入 query；不要重复执行该 shell 命令。"
-                    ),
-                    "recovery": "Builtin_music_download 支持 query（例如 Alan Walker Alone），会自动搜索并转成 QQ 语音。",
-                }
-            if _YOUTUBE_COMMAND_RE.search(command):
-                return {
-                    "ok": False,
-                    "retry_safe": True,
-                    "required_tool": "Builtin_youtube_download",
-                    "failure_kind": "wrong_tool_for_youtube_download",
-                    "command": command,
-                    "error": (
-                        "检测到这是 YouTube 视频搜索/下载命令；未执行。请改用 Builtin_youtube_download。"
-                        "有链接时传 url，没有链接时把标题、歌手和清晰度传入 query；不要重复执行该 shell 命令。"
-                    ),
-                    "recovery": "Builtin_youtube_download 支持 url 或 query，并会自动转成 QQ 可播放的视频卡片。",
+                    "error": f"命令已被安全拦截（{power_reason}）：未执行，也不允许重试或绕过。",
+                    "recovery": "只能继续处理非关机、非重启、非注销、非休眠和非电源切换命令。",
                 }
             workspace = self.conversation_workspace(conversation_id)
             await self._send_command_activity_notice(turn_id, conversation_id, command)
@@ -4391,11 +4655,46 @@ class AgentService:
             shutil.rmtree(frame_dir, ignore_errors=True)
 
     async def _send_command_activity_notice(self, turn_id: int, conversation_id: str, command: str) -> Dict[str, Any]:
-        text = "正在执行指令：" + command
-        if len(text) > MAX_QQ_TEXT_CHARS:
-            text = text[:MAX_QQ_TEXT_CHARS - 20] + "…（指令过长）"
+        # Count actual command attempts, including a process that fails to
+        # start.  ``turn_id`` is the durable Agent turn boundary, so recovery
+        # commands in the same turn share one cadence while a new QQ event
+        # starts over at one.  Normalise whitespace so a multi-line command
+        # cannot turn a short progress line into a large QQ message.
+        try:
+            key = (max(0, int(turn_id)), str(conversation_id))
+        except (TypeError, ValueError):
+            key = (0, str(conversation_id))
+        command_count = self._command_activity_counts.get(key, 0) + 1
+        self._command_activity_counts[key] = command_count
+        # Keep this process-local map bounded; the oldest entries are complete
+        # turns and have no effect on command execution or tool results.
+        if len(self._command_activity_counts) > 4096:
+            self._command_activity_counts.pop(next(iter(self._command_activity_counts)))
+
+        should_send_detail = command_count <= COMMAND_PROGRESS_INITIAL_NOTICES
+        should_send_periodic = (
+            command_count > COMMAND_PROGRESS_INITIAL_NOTICES
+            and command_count % COMMAND_PROGRESS_REPORT_EVERY == 0
+        )
+        if not should_send_detail and not should_send_periodic:
+            return {
+                "ok": True,
+                "skipped": True,
+                "service_activity": True,
+                "reason": "command_progress_throttled",
+                "command_count": command_count,
+            }
+
+        if should_send_detail:
+            display_command = " ".join(command.split())
+            preview = display_command[:COMMAND_PROGRESS_PREVIEW_CHARS]
+            if len(display_command) > COMMAND_PROGRESS_PREVIEW_CHARS:
+                preview += "…"
+            text = "正在执行指令：" + preview
+        else:
+            text = "正在执行命令，已执行%d次" % command_count
         if not self.adapter or not self.adapter.connected:
-            return {"ok": False, "error": "OneBot 未连接，未发送执行提示"}
+            return {"ok": False, "command_count": command_count, "error": "OneBot 未连接，未发送执行提示"}
         try:
             action, params = self._qq_send_action(conversation_id, [{"type": "text", "data": {"text": text}}])
             response = await self.adapter.call(action, params)
@@ -4404,9 +4703,13 @@ class AgentService:
             if message_id:
                 self.db.add_sent_message(message_id, conversation_id, turn_id, text)
                 self.db.mark_app_sent_event_ignored(conversation_id, message_id)
-            return {"ok": True, "message_id": message_id}
+            return {"ok": True, "message_id": message_id, "command_count": command_count}
         except Exception as exc:
-            return {"ok": False, "error": "执行提示发送失败：" + redact_error_detail(exc, limit=600)}
+            return {
+                "ok": False,
+                "command_count": command_count,
+                "error": "执行提示发送失败：" + redact_error_detail(exc, limit=600),
+            }
 
     def _onebot_file_source_actions(
         self,
@@ -4947,9 +5250,9 @@ class AgentService:
                         reasoning_effort=reasoning_effort,
                     )
                 )
-            # Keep each intermediate request within a practical context size;
-            # recursively merge only when the list of 20K summaries itself is
-            # larger than the same 300 KiB transport budget.
+            # Keep each intermediate request within the same estimated 300K
+            # token single-turn budget; recursively merge only when the list
+            # of 20K summaries itself is larger than that transport estimate.
             current = summaries
             while len("\n\n".join(current).encode("utf-8")) > VIDEO_FRAME_CHUNK_BYTES and len(current) > 1:
                 groups: List[List[str]] = []
@@ -5016,6 +5319,12 @@ class AgentService:
             "30",
             "--print",
             "after_move:filepath",
+            "--print",
+            "id:%(id)s",
+            "--print",
+            "title:%(title)s",
+            "--print",
+            "webpage_url:%(webpage_url)s",
             "-f",
             format_selector,
         ]
@@ -5066,6 +5375,8 @@ class AgentService:
             process.kill()
             raw_output, _ = await process.communicate()
         output = raw_output.decode("utf-8", errors="replace") if raw_output else ""
+        authentication_warning = _yt_dlp_authentication_warning(output, "Bilibili")
+        result_metadata = _yt_dlp_result_metadata(output)
         candidates: List[Path] = []
         for line in output.splitlines():
             candidate = Path(line.strip().strip('"'))
@@ -5076,11 +5387,15 @@ class AgentService:
         if timed_out:
             return {
                 "ok": False,
+                "retry_safe": True,
+                "qq_side_effect": False,
                 "returncode": process.returncode,
                 "output": output[-MAX_COMMAND_OUTPUT_CHARS:],
                 "yt_dlp_output": output[-20_000:],
                 "cookies_from_file": has_cookie_file,
                 "proxy_from_windows": bool(proxy),
+                "authentication_warning": authentication_warning,
+                "source_metadata": result_metadata,
                 "error": "yt-dlp 下载超过 600 秒，已终止子进程；请检查 Bilibili 链接、网络或 cookie。",
             }
         if process.returncode != 0 or not candidates:
@@ -5093,56 +5408,53 @@ class AgentService:
                 error = "yt-dlp 下载失败或未找到输出文件；已保留完整诊断输出。"
             return {
                 "ok": False,
+                "retry_safe": True,
+                "qq_side_effect": False,
                 "returncode": process.returncode,
                 "output": output[-MAX_COMMAND_OUTPUT_CHARS:],
                 "yt_dlp_output": output[-20_000:],
                 "cookies_from_file": has_cookie_file,
                 "proxy_from_windows": bool(proxy),
+                "authentication_warning": authentication_warning,
+                "source_metadata": result_metadata,
                 "error": error,
             }
         path = max(candidates, key=lambda item: item.stat().st_mtime)
-        source_path = path
         audio_only = bool(arguments.get("audio_only", False))
         is_video = not audio_only and self._is_video_file(path)
         if path.stat().st_size > (MAX_VIDEO_FILE_BYTES if is_video else MAX_WORKSPACE_FILE_BYTES):
             raise WorkspaceError(
-                "下载视频超过 2 GiB，不能发送"
+                "下载视频超过 2 GiB，不能保存到当前会话工作区"
                 if is_video
-                else "下载文件超过 100 MiB，不能发送"
+                else "下载文件超过 100 MiB，不能保存到当前会话工作区"
             )
-        if is_video:
-            # Do not trust the extension or yt-dlp's merge container: QQ's
-            # player is much stricter than a desktop player.  Normalize every
-            # downloaded video before constructing the native card.
-            path = await self._transcode_video_for_qq(path)
-        if path.stat().st_size > (MAX_VIDEO_FILE_BYTES if self._is_video_file(path) else MAX_WORKSPACE_FILE_BYTES):
-            raise WorkspaceError(
-                "下载视频超过 2 GiB，不能发送"
-                if self._is_video_file(path)
-                else "下载文件超过 100 MiB，不能发送"
-            )
-        # An MP4 sent through the generic file upload API appears as a file
-        # attachment in QQ.  Use OneBot's video segment first so QQ renders a
-        # native, inline playable video card instead.  Explicit audio-only or
-        # non-MP4 requests retain the normal file-delivery behavior: calling a
-        # video segment for an MP3/M4A is neither a valid QQ video card nor a
-        # useful fallback for the caller.
-        if self._is_video_file(path) and not bool(arguments.get("audio_only", False)):
-            sent = await self._send_video_to_conversation(conversation_id, path, path.name)
-        else:
-            sent = await self._send_file_to_conversation(conversation_id, path, path.name)
-            if sent.get("ok") is True:
-                sent["delivery"] = "file"
+        try:
+            relative_path = path.resolve().relative_to(workspace.resolve()).as_posix()
+        except ValueError as exc:
+            raise WorkspaceError("yt-dlp 输出文件不在当前会话工作区内，已拒绝接收") from exc
+
+        # Deliberately do not call any QQ send API here.  The Agent must first
+        # inspect/validate the downloaded file and may then explicitly call
+        # send_group_file(path=...) if the member actually asked to receive it.
+        # In particular, a search result must never be sent before the Agent has
+        # a chance to notice that yt-dlp selected the wrong video.
         return {
-            **sent,
+            "ok": True,
+            "delivery": "workspace",
+            "sent": False,
+            "qq_side_effect": False,
+            "workspace": str(workspace),
+            "path": relative_path,
+            "file": relative_path,
+            "filename": path.name,
             "url": url,
-            "path": path.name,
-            "source_path": source_path.name if source_path != path else "",
-            "qq_compatible": bool(path != source_path and path.suffix.lower() == ".mp4"),
             "bytes": path.stat().st_size,
             "yt_dlp_output": output[-20_000:],
             "cookies_from_file": has_cookie_file,
             "proxy_from_windows": bool(proxy),
+            "authentication_warning": authentication_warning,
+            "source_metadata": result_metadata,
+            "next_step": "先检查工作区文件；确认内容正确且需要发送时，再调用 send_group_file(path=该路径)。",
         }
 
     async def _youtube_download(
@@ -5196,6 +5508,12 @@ class AgentService:
             "30",
             "--print",
             "after_move:filepath",
+            "--print",
+            "id:%(id)s",
+            "--print",
+            "title:%(title)s",
+            "--print",
+            "webpage_url:%(webpage_url)s",
             "-f",
             format_selector,
         ]
@@ -5246,6 +5564,8 @@ class AgentService:
             process.kill()
             raw_output, _ = await process.communicate()
         output = raw_output.decode("utf-8", errors="replace") if raw_output else ""
+        authentication_warning = _yt_dlp_authentication_warning(output, "YouTube")
+        result_metadata = _yt_dlp_result_metadata(output)
         candidates: List[Path] = []
         for line in output.splitlines():
             candidate = Path(line.strip().strip('"'))
@@ -5260,11 +5580,15 @@ class AgentService:
         if timed_out:
             return {
                 "ok": False,
+                "retry_safe": True,
+                "qq_side_effect": False,
                 "returncode": process.returncode,
                 "output": output[-MAX_COMMAND_OUTPUT_CHARS:],
                 "yt_dlp_output": output[-20_000:],
                 "cookies_from_file": has_cookie_file,
                 "proxy_from_windows": bool(proxy),
+                "authentication_warning": authentication_warning,
+                "source_metadata": result_metadata,
                 "error": "yt-dlp 下载超过 600 秒，已终止子进程；请检查 YouTube 链接/搜索词、网络或 cookie。",
             }
         if process.returncode != 0 or not candidates:
@@ -5277,50 +5601,54 @@ class AgentService:
                 error = "yt-dlp 下载失败或未找到输出文件；已保留完整诊断输出。"
             return {
                 "ok": False,
+                "retry_safe": True,
+                "qq_side_effect": False,
                 "returncode": process.returncode,
                 "output": output[-MAX_COMMAND_OUTPUT_CHARS:],
                 "yt_dlp_output": output[-20_000:],
                 "cookies_from_file": has_cookie_file,
                 "proxy_from_windows": bool(proxy),
+                "authentication_warning": authentication_warning,
+                "source_metadata": result_metadata,
                 "error": error,
             }
 
         path = max(candidates, key=lambda item: item.stat().st_mtime)
-        source_path = path
         audio_only = bool(arguments.get("audio_only", False))
         is_video = not audio_only and self._is_video_file(path)
         if path.stat().st_size > (MAX_VIDEO_FILE_BYTES if is_video else MAX_WORKSPACE_FILE_BYTES):
             raise WorkspaceError(
-                "下载视频超过 2 GiB，不能发送"
+                "下载视频超过 2 GiB，不能保存到当前会话工作区"
                 if is_video
-                else "下载文件超过 100 MiB，不能发送"
+                else "下载文件超过 100 MiB，不能保存到当前会话工作区"
             )
-        if is_video:
-            path = await self._transcode_video_for_qq(path)
-        if path.stat().st_size > (MAX_VIDEO_FILE_BYTES if self._is_video_file(path) else MAX_WORKSPACE_FILE_BYTES):
-            raise WorkspaceError(
-                "下载视频超过 2 GiB，不能发送"
-                if self._is_video_file(path)
-                else "下载文件超过 100 MiB，不能发送"
-            )
-        if self._is_video_file(path) and not audio_only:
-            sent = await self._send_video_to_conversation(conversation_id, path, path.name)
-        else:
-            sent = await self._send_file_to_conversation(conversation_id, path, path.name)
-            if sent.get("ok") is True:
-                sent["delivery"] = "file"
+        try:
+            relative_path = path.resolve().relative_to(workspace.resolve()).as_posix()
+        except ValueError as exc:
+            raise WorkspaceError("yt-dlp 输出文件不在当前会话工作区内，已拒绝接收") from exc
+
+        # Download tools are workspace-only.  No video/file message is sent by
+        # this function; an explicit later send_group_file call is required
+        # after the Agent verifies the actual downloaded result.
         return {
-            **sent,
+            "ok": True,
+            "delivery": "workspace",
+            "sent": False,
+            "qq_side_effect": False,
+            "workspace": str(workspace),
+            "path": relative_path,
+            "file": relative_path,
+            "filename": path.name,
             "url": url,
             "query": query,
             "source": target,
-            "path": path.name,
-            "source_path": source_path.name if source_path != path else "",
-            "qq_compatible": bool(path != source_path and path.suffix.lower() == ".mp4"),
             "bytes": path.stat().st_size,
             "yt_dlp_output": output[-20_000:],
             "cookies_from_file": has_cookie_file,
             "proxy_from_windows": bool(proxy),
+            "authentication_warning": authentication_warning,
+            "source_metadata": result_metadata,
+            "next_step": "先检查工作区文件；确认内容正确且需要发送时，再调用 send_group_file(path=该路径)。",
         }
 
     async def _music_download(
@@ -5411,6 +5739,1116 @@ class AgentService:
             "bytes": downloaded.path.stat().st_size,
             "source_url": downloaded.source_url,
         }
+
+    # Google Flow asynchronous video generation
+    def _flow_video_client(self) -> FlowVideoClient:
+        """Build a client for the separately running local Flow API."""
+
+        api_key = os.environ.get("FLOW_API_KEY", "").strip()
+        return FlowVideoClient(
+            self.settings.flow_video_api_url,
+            api_key,
+            timeout=FLOW_VIDEO_POLL_TIMEOUT_SECONDS,
+            create_timeout=FLOW_VIDEO_CREATE_TIMEOUT_SECONDS,
+        )
+
+    @staticmethod
+    def _flow_video_public_job(job: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a model-safe view without local paths or credentials."""
+
+        result = {
+            "job_id": _as_string(job.get("job_id")),
+            "prompt": _as_string(job.get("prompt"))[:500],
+            "status": _as_string(job.get("status")) or "queued",
+            "progress": max(0, min(100, int(job.get("progress") or 0))),
+            "model": _as_string(job.get("model")),
+            "seconds": int(job.get("seconds") or 0),
+            "size": _as_string(job.get("size")),
+            "outputs": int(job.get("outputs") or 1),
+            "retry_count": max(0, int(job.get("retry_count") or 0)),
+            "retry_of_job_id": _as_string(job.get("retry_of_job_id"))[:200],
+            "created_at": _as_string(job.get("created_at")),
+            "started_at": _as_string(job.get("started_at")),
+            "completed_at": _as_string(job.get("completed_at")),
+            "delivery_status": _as_string(job.get("delivery_status")) or "pending",
+            "delivery_message_count": len(job.get("delivery_message_ids") or []),
+        }
+        error = job.get("error")
+        if isinstance(error, dict):
+            result["error"] = dict(error)
+        elif _as_string(error).strip():
+            result["error"] = _as_string(error).strip()[:4_000]
+        if _as_string(job.get("project_url")).strip():
+            result["project_url"] = _as_string(job.get("project_url"))[:2_000]
+        result["result_ready"] = result["status"] == "completed"
+        return result
+
+    @staticmethod
+    def _flow_video_error_result(exc: BaseException, *, retry_safe: bool = False) -> Dict[str, Any]:
+        detail = redact_error_detail(exc, limit=2_000)
+        result: Dict[str, Any] = {
+            "ok": False,
+            "error": detail or "Flow 视频服务调用失败",
+            "flow_video": True,
+        }
+        if isinstance(exc, FlowVideoError):
+            if exc.status_code:
+                result["http_status"] = exc.status_code
+            if exc.code:
+                result["code"] = exc.code
+        if retry_safe:
+            result["retry_safe"] = True
+            result["retry_safe_reason"] = "Flow API 在接受任务前返回了明确的参数错误；未创建视频任务。"
+        return result
+
+    def _flow_video_job_reference_path(self, conversation_id: str, value: Any) -> str:
+        reference = _as_string(value).strip()
+        if not reference:
+            return ""
+        if len(reference) > FLOW_VIDEO_MAX_REFERENCE_CHARS:
+            raise ValueError("input_reference 路径过长")
+        if reference.lower().startswith("data:"):
+            raise ValueError("input_reference 只允许当前会话工作目录中的本地图片路径")
+        path = self.workspace.resolve(conversation_id, reference)
+        if not path.is_file():
+            raise ValueError("input_reference 图片不存在：" + reference)
+        if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise ValueError("input_reference 必须是 PNG、JPEG 或 WebP 图片")
+        return str(path)
+
+    async def _send_flow_video_failure_notice(
+        self,
+        conversation_id: str,
+        job_id: str,
+        error: str,
+    ) -> Dict[str, Any]:
+        """Tell the originating conversation about a definitive job failure."""
+
+        if not self.adapter or not self.adapter.connected:
+            return {"ok": False, "skipped": True, "error": "OneBot 未连接，失败说明暂未发送"}
+        text = "视频生成任务 %s 失败：%s" % (
+            _as_string(job_id)[:120] or "未知任务",
+            _as_string(error).strip()[:1_600] or "未返回错误详情",
+        )
+        turn_id = self.db.create_turn(conversation_id, [])
+        result: Dict[str, Any] = {
+            "ok": False,
+            "error": "失败说明未发送",
+        }
+        safe_job_id = _as_string(job_id)[:120] or "unknown"
+        for attempt, delay in enumerate(FLOW_VIDEO_FAILURE_NOTICE_RETRY_DELAYS):
+            if attempt and delay:
+                await asyncio.sleep(delay)
+            # Use a distinct durable slot for each network retry.  Reusing a
+            # failed operation slot would correctly deduplicate to the first
+            # error, which is not what a transient OneBot reconnect needs.
+            result = await self._execute_tool(
+                turn_id,
+                conversation_id,
+                "send_group_message",
+                {"text": text},
+                "flow-video-failure-%s-%s" % (safe_job_id, attempt),
+                operation_slot=attempt,
+                operation_namespace="flow_video_failure_v2",
+                app_sent_metadata={"memory_processed": True, "flow_video_failure_notice": True},
+            )
+            if result.get("ok") is True:
+                break
+            detail = _as_string(result.get("error"))
+            lowered = detail.casefold()
+            transient_network = (
+                ("retcode=100" in lowered)
+                or ("网络连接异常" in detail)
+                or ("websocket" in lowered)
+                or ("onebot 未连接" in lowered)
+                or ("connection" in lowered)
+            )
+            # A timeout has an unknown remote outcome.  Do not blindly send
+            # another copy of a failure notice in that case; the private
+            # diagnostic event remains durable for a later operator/Agent
+            # turn after reconnect.
+            if not transient_network or "timeout" in lowered or "超时" in detail:
+                break
+            logger.warning(
+                "Flow failure notice attempt %s/%s failed transiently for %s: %s",
+                attempt + 1,
+                len(FLOW_VIDEO_FAILURE_NOTICE_RETRY_DELAYS),
+                safe_job_id,
+                detail[:800],
+            )
+        self.db.finish_turn(
+            turn_id,
+            "auxiliary" if result.get("ok") is True else "auxiliary_failed",
+            "视频生成失败说明已发送" if result.get("ok") is True else "视频生成失败说明未发送",
+            error=_as_string(result.get("error")) if result.get("ok") is not True else "",
+        )
+        return result
+
+    @staticmethod
+    def _is_retryable_flow_timeout(error: Any) -> bool:
+        """Return true only for the known post-submit Flow browser timeout."""
+
+        probe = _as_string(error).strip().casefold()
+        return bool(probe) and (
+            bool(FLOW_VIDEO_TIMEOUT_PATTERN.search(probe))
+            or any(marker in probe for marker in FLOW_VIDEO_TIMEOUT_MARKERS)
+        )
+
+    async def _schedule_worker_when_idle(self, group_id: str) -> None:
+        """Wake a group worker after an already-running turn releases it.
+
+        Flow monitoring runs independently from the message worker.  If a
+        terminal Flow error is recorded while the worker is busy, calling
+        ``_schedule_worker`` immediately is a no-op.  Waiting here prevents
+        the private failure event from being stranded without allowing two
+        workers for one conversation.
+        """
+
+        while not self._stopping:
+            current = self._workers.get(group_id)
+            if not current or current.done():
+                break
+            await asyncio.sleep(0.25)
+        await self._schedule_worker(group_id)
+
+    def _enqueue_flow_video_failure_event(
+        self,
+        job: Dict[str, Any],
+        error: str,
+        *,
+        retry_recommended: bool = False,
+        retry_scheduled_job_id: str = "",
+    ) -> None:
+        """Persist a private diagnostic so the normal Agent can reason about it.
+
+        This is intentionally an event, not a QQ message.  It contains the
+        exact bounded error and original video arguments, while its text tells
+        the model not to quote the diagnostic verbatim to members.  The
+        deterministic dedupe key makes repeated monitor polls harmless.
+        """
+
+        conversation_id = _as_string(job.get("conversation_id"))
+        job_id = _as_string(job.get("job_id"))
+        if not conversation_id or not job_id:
+            return
+        detail = redact_error_detail(error, limit=2_400)
+        retry_count = max(0, int(job.get("retry_count") or 0))
+        scheduled = _as_string(retry_scheduled_job_id).strip()[:200]
+        retry_arguments = {
+            "prompt": _as_string(job.get("prompt"))[:FLOW_VIDEO_MAX_PROMPT_CHARS],
+            "model": _as_string(job.get("model"))[:FLOW_VIDEO_MAX_MODEL_CHARS],
+            "seconds": int(job.get("seconds") or 8),
+            "size": _as_string(job.get("size"))[:40],
+            "n": max(1, int(job.get("outputs") or 1)),
+        }
+        lines = [
+            "【内部 Flow 视频失败事件：仅供主 Agent 处理，不是群成员发言】",
+            "任务 %s（模型 %s，%ss，%s，输出 %s 个）失败。"
+            % (
+                job_id[:200],
+                retry_arguments["model"] or "未知",
+                retry_arguments["seconds"],
+                retry_arguments["size"] or "未知尺寸",
+                retry_arguments["n"],
+            ),
+            "完整错误：" + (detail or "未返回错误详情"),
+            "原始创作请求（仅用于判断修复方式）：" + retry_arguments["prompt"],
+            "不要把本事件原文或内部错误逐字转发到 QQ。",
+        ]
+        if scheduled:
+            lines.append(
+                "服务已自动提交一次重试任务 %s；不要再次机械创建相同任务，后续应查询该任务结果。"
+                % scheduled
+            )
+        elif self._is_retryable_flow_timeout(error):
+            lines.append(
+                "这是已提交后的等待超时；当前日志没有队列长度或拥堵指标，"
+                "禁止把它描述为“云端队列拥堵”。"
+            )
+        elif retry_recommended:
+            lines.append(
+                "该错误允许主 Agent 使用完全相同参数调用 Builtin_video_generation_create 一次；"
+                "调用后不要循环重试。"
+            )
+        else:
+            lines.append(
+                "服务已达到自动重试上限或该错误不可安全重试；如需继续，请分析错误并选择不同方案，"
+                "不要无限重复相同调用。"
+            )
+        event = {
+            "dedupe_key": "%s%s" % (FLOW_VIDEO_FAILURE_DEDUPE_PREFIX, job_id[:200]),
+            "group_id": conversation_id,
+            "event_type": FLOW_VIDEO_FAILURE_EVENT_TYPE,
+            "sub_type": "timeout" if self._is_retryable_flow_timeout(error) else "error",
+            "message_id": "",
+            "occurred_at": int(time.time()),
+            "sender_id": "",
+            "sender_name": "系统",
+            "self_id": "",
+            "normalized_text": "\n".join(lines)[:MAX_EVENT_TEXT_CHARS],
+            "content": {
+                "service_generated": True,
+                "flow_video_failure": True,
+                "agent_action_required": True,
+                "job_id": job_id[:200],
+                "retry_count": retry_count,
+                "retry_recommended": bool(retry_recommended),
+                "retry_scheduled_job_id": scheduled,
+                "retry_arguments": retry_arguments,
+            },
+            "raw": {},
+            "is_self": True,
+            "pending": True,
+            "archived": False,
+            "memory_processed": True,
+        }
+        inserted = self.db.insert_event(event)
+        if inserted is None:
+            return
+        group = self.db.get_group(conversation_id)
+        if group and group.get("enabled"):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                # Synchronous database/unit-test callers can still inspect the
+                # durable event; there is no event loop in which to wake a
+                # worker yet.
+                logger.debug("Flow failure event queued without active event loop: %s", job_id)
+            else:
+                self._track_background_task(self._schedule_worker_when_idle(conversation_id))
+
+    async def _retry_flow_video_job_once(
+        self,
+        job: Dict[str, Any],
+        error: str,
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Submit at most one replacement job for the exact Flow wait timeout."""
+
+        if not self._is_retryable_flow_timeout(error):
+            return None, ""
+        retry_count = max(0, int(job.get("retry_count") or 0))
+        if retry_count >= FLOW_VIDEO_AUTO_RETRY_LIMIT:
+            return None, ""
+        conversation_id = _as_string(job.get("conversation_id"))
+        parent_id = _as_string(job.get("job_id"))
+        prompt = _as_string(job.get("prompt")).strip()
+        if not conversation_id or not parent_id or not prompt:
+            return None, "自动重试缺少原任务参数，未再次提交"
+        arguments = {
+            "prompt": prompt,
+            # A retry must not resurrect a legacy Veo selection.  Flow video
+            # jobs are now pinned to the single supported Omni model.
+            "model": FLOW_VIDEO_MODEL,
+            "seconds": max(1, int(job.get("seconds") or 8)),
+            "size": _as_string(job.get("size") or "1280x720"),
+            "outputs": max(1, int(job.get("outputs") or 1)),
+        }
+        try:
+            upstream = await self._flow_video_client().create(**arguments)
+            new_job_id = _as_string(upstream.get("id")).strip()
+            if not new_job_id:
+                raise FlowVideoError("Flow 自动重试未返回任务 ID")
+            if new_job_id == parent_id:
+                raise FlowVideoError("Flow 自动重试返回了原任务 ID，拒绝重复跟踪")
+            upstream_status = _as_string(upstream.get("status") or "queued").lower()
+            if upstream_status in FLOW_VIDEO_TERMINAL_STATUSES:
+                upstream_error = upstream.get("error")
+                detail = _as_string(
+                    upstream_error.get("message") if isinstance(upstream_error, dict) else upstream_error
+                ).strip()
+                raise FlowVideoError(
+                    "自动重试任务创建后立即%s：%s"
+                    % ("失败" if upstream_status == "failed" else "取消", detail or "Flow 未提供详情")
+                )
+            seconds_result = upstream.get("seconds", arguments["seconds"])
+            try:
+                seconds_result = int(seconds_result)
+            except (TypeError, ValueError):
+                seconds_result = arguments["seconds"]
+            replacement = self.db.create_flow_video_job(
+                conversation_id,
+                new_job_id,
+                prompt=prompt,
+                model=_as_string(upstream.get("model") or arguments["model"]),
+                seconds=seconds_result,
+                size=_as_string(upstream.get("size") or arguments["size"]),
+                outputs=int(upstream.get("output_count") or arguments["outputs"]),
+                retry_count=retry_count + 1,
+                retry_of_job_id=parent_id,
+                status=upstream_status,
+                progress=int(upstream.get("progress") or 0),
+                created_at=_as_string(upstream.get("created_at")),
+                started_at=_as_string(upstream.get("started_at")),
+                completed_at=_as_string(upstream.get("completed_at")),
+                project_url=_as_string(upstream.get("project_url")),
+                error=(
+                    json.dumps(upstream.get("error"), ensure_ascii=False)
+                    if isinstance(upstream.get("error"), dict)
+                    else _as_string(upstream.get("error"))
+                ),
+            )
+            return replacement, ""
+        except Exception as exc:
+            return None, redact_error_detail(exc, limit=2_000) or "自动重试提交失败"
+
+    async def _send_flow_video_acceptance_notice(
+        self,
+        turn_id: int,
+        conversation_id: str,
+        job_id: str,
+        *,
+        status: str,
+        retry_of: str = "",
+    ) -> Dict[str, Any]:
+        """Send the one visible acknowledgement for an accepted async job.
+
+        The normal model turn stores its final text as a private rolling
+        summary.  Without this service-owned acknowledgement, a successful
+        video creation request would appear silent to a member who did not
+        explicitly @ the bot.  This message contains only the accepted task
+        ID and status, never the internal summary or local Flow credentials.
+        """
+
+        if not self.adapter or not self.adapter.connected:
+            return {"ok": False, "skipped": True, "error": "OneBot 未连接，视频任务已创建但未发送确认"}
+        if _as_string(retry_of).strip():
+            text = "上一个视频任务等待超时，已自动重试（新任务 %s，状态 %s），完成后会自动发送视频。" % (
+                _as_string(job_id)[:120] or "未知",
+                _as_string(status) or "queued",
+            )
+        else:
+            text = "视频生成任务已创建（任务 %s，状态 %s），完成后会自动发送视频。" % (
+                _as_string(job_id)[:120] or "未知",
+                _as_string(status) or "queued",
+            )
+        try:
+            action, params = self._qq_send_action(
+                conversation_id,
+                [{"type": "text", "data": {"text": text}}],
+            )
+            response = await self.adapter.call(action, params)
+            data = response.get("data") or {}
+            message_id = _as_string(data.get("message_id") if isinstance(data, dict) else "")
+            if message_id:
+                self.db.add_sent_message(message_id, conversation_id, turn_id, text)
+                self.db.insert_event(
+                    {
+                        "dedupe_key": "%s:message:%s" % (conversation_id, message_id),
+                        "group_id": conversation_id,
+                        "event_type": "message.app_sent",
+                        "sub_type": "",
+                        "message_id": message_id,
+                        "occurred_at": int(time.time()),
+                        "sender_id": "",
+                        "sender_name": "机器人",
+                        "self_id": "",
+                        "normalized_text": text,
+                        "content": {
+                            "app_sent": True,
+                            "flow_video_acceptance": True,
+                            "memory_processed": True,
+                        },
+                        "raw": {},
+                        "is_self": True,
+                        "pending": False,
+                        "archived": False,
+                        "memory_processed": True,
+                    }
+                )
+                self.db.mark_app_sent_event_ignored(conversation_id, message_id)
+            return {"ok": True, "message_id": message_id, "service_activity": True}
+        except Exception as exc:
+            return {
+                "ok": False,
+                "skipped": True,
+                "error": "视频生成任务确认发送失败：" + redact_error_detail(exc, limit=800),
+            }
+
+    async def _flow_video_mark_terminal_failure(
+        self,
+        job: Dict[str, Any],
+        error: str,
+        *,
+        notify: bool = True,
+    ) -> Dict[str, Any]:
+        conversation_id = _as_string(job.get("conversation_id"))
+        job_id = _as_string(job.get("job_id"))
+        lock_key = conversation_id + ":" + job_id
+        lock = self._flow_video_failure_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            return await self._flow_video_mark_terminal_failure_unlocked(
+                job,
+                error,
+                notify=notify,
+            )
+
+    async def _flow_video_mark_terminal_failure_unlocked(
+        self,
+        job: Dict[str, Any],
+        error: str,
+        *,
+        notify: bool = True,
+    ) -> Dict[str, Any]:
+        conversation_id = _as_string(job.get("conversation_id"))
+        job_id = _as_string(job.get("job_id"))
+        # Older Flow API builds used a 900 s post-submit browser deadline.  Keep
+        # this narrow compatibility path for jobs already returned by one of
+        # those builds; the current launcher sets FLOW_TIMEOUT_MS=1200000
+        # (20 minutes), so new jobs are no longer cut off by the old 900-second
+        # deadline.  The worker still reports a definitive timeout after that
+        # configured ceiling.
+        # The legacy retry is durable through ``retry_count``/``retry_of_job_id``
+        # so a restart or duplicate poll cannot spend another credit.
+        replacement, retry_error = await self._retry_flow_video_job_once(job, error)
+        if replacement is not None:
+            replacement_id = _as_string(replacement.get("job_id"))
+            parent_error = (
+                "Flow 视频任务等待超时，已自动提交一次重试任务：%s。"
+                % (replacement_id or "未知")
+            )
+            updated = self.db.update_flow_video_job(
+                conversation_id,
+                job_id,
+                status="failed",
+                progress=int(job.get("progress") or 0),
+                error=parent_error,
+                delivery_status="failed",
+            ) or {
+                **job,
+                "status": "failed",
+                "error": parent_error,
+                "delivery_status": "failed",
+            }
+            # This acknowledgement is best-effort; the replacement remains
+            # pending in SQLite and the independent monitor will deliver the
+            # real video after completion.  A disconnected OneBot must not
+            # turn a successful retry submission into another Flow failure.
+            if notify:
+                notice = await self._send_flow_video_acceptance_notice(
+                    0,
+                    conversation_id,
+                    replacement_id,
+                    status=_as_string(replacement.get("status")) or "queued",
+                    retry_of=job_id,
+                )
+                if notice.get("ok") is not True and not notice.get("skipped"):
+                    logger.warning("could not send Flow retry notice for %s: %s", job_id, notice)
+            return updated
+
+        final_error = _as_string(error).strip()[:4_000]
+        if retry_error:
+            final_error = (
+                final_error
+                + "；已尝试自动重试但提交失败："
+                + _as_string(retry_error).strip()[:2_000]
+            )[:4_000]
+        retry_was_attempted = (
+            self._is_retryable_flow_timeout(error)
+            and max(0, int(job.get("retry_count") or 0)) < FLOW_VIDEO_AUTO_RETRY_LIMIT
+        )
+        final_changes: Dict[str, Any] = {
+            "status": "failed",
+            "progress": int(job.get("progress") or 0),
+            "error": final_error,
+            "delivery_status": "failed",
+        }
+        if retry_was_attempted:
+            # Claim the one retry slot even when Flow rejected the replacement
+            # request.  This makes a duplicate terminal callback idempotent.
+            final_changes["retry_count"] = FLOW_VIDEO_AUTO_RETRY_LIMIT
+        updated = self.db.update_flow_video_job(
+            conversation_id,
+            job_id,
+            **final_changes,
+        ) or {**job, "status": "failed", "error": final_error, "delivery_status": "failed"}
+        self._enqueue_flow_video_failure_event(
+            updated,
+            final_error,
+            retry_recommended=bool(retry_error and not self._is_retryable_flow_timeout(retry_error)),
+        )
+        if notify:
+            notice = await self._send_flow_video_failure_notice(conversation_id, job_id, final_error)
+            if notice.get("ok") is not True and not notice.get("skipped"):
+                logger.warning("could not send Flow failure notice for %s: %s", job_id, notice)
+        return updated
+
+    async def _refresh_flow_video_job(
+        self,
+        job: Dict[str, Any],
+        *,
+        notify_failure: bool = True,
+    ) -> Dict[str, Any]:
+        """Refresh one upstream job and deliver it if it became complete."""
+
+        conversation_id = _as_string(job.get("conversation_id"))
+        job_id = _as_string(job.get("job_id"))
+        if not job_id:
+            return job
+        current = self.db.get_flow_video_job(conversation_id, job_id) or job
+        status = _as_string(current.get("status")).lower()
+        if status in FLOW_VIDEO_TERMINAL_STATUSES:
+            if status == "completed" and current.get("delivery_status") in {"pending", "sending"}:
+                if self.settings.flow_video_auto_send:
+                    await self._deliver_flow_video_job(current, notify_failure=notify_failure)
+                else:
+                    self.db.update_flow_video_job(
+                        conversation_id,
+                        job_id,
+                        delivery_status="ready",
+                        error="",
+                    )
+                return self.db.get_flow_video_job(conversation_id, job_id) or current
+            return current
+        try:
+            upstream = await self._flow_video_client().get(job_id)
+        except FlowVideoError as exc:
+            # A 404 after the Flow process restarted is deterministic: its
+            # in-memory job map was lost.  Authentication/parameter errors are
+            # also terminal; timeouts and 5xx remain pending for a later poll.
+            if exc.status_code in {400, 401, 403, 404, 409}:
+                return await self._flow_video_mark_terminal_failure(
+                    current,
+                    "Flow 视频任务无法继续查询：" + (str(exc) or "上游任务不存在"),
+                    notify=notify_failure,
+                )
+            failures = int(current.get("poll_failures") or 0) + 1
+            updated = self.db.update_flow_video_job(
+                conversation_id,
+                job_id,
+                poll_failures=failures,
+                last_poll_at=datetime.now(timezone.utc).isoformat(),
+                error=str(exc)[:4_000],
+            )
+            return updated or current
+        except Exception as exc:
+            failures = int(current.get("poll_failures") or 0) + 1
+            updated = self.db.update_flow_video_job(
+                conversation_id,
+                job_id,
+                poll_failures=failures,
+                last_poll_at=datetime.now(timezone.utc).isoformat(),
+                error=redact_error_detail(exc, limit=4_000),
+            )
+            return updated or current
+
+        upstream_status = _as_string(upstream.get("status")).lower()
+        if upstream_status not in {"queued", "in_progress", "completed", "failed", "cancelled"}:
+            upstream_status = status or "queued"
+        seconds_value = upstream.get("seconds", current.get("seconds", 8))
+        try:
+            seconds_value = int(seconds_value)
+        except (TypeError, ValueError):
+            seconds_value = int(current.get("seconds") or 8)
+        updated = self.db.update_flow_video_job(
+            conversation_id,
+            job_id,
+            status=upstream_status,
+            progress=int(upstream.get("progress") or 0),
+            model=_as_string(upstream.get("model") or current.get("model")),
+            seconds=seconds_value,
+            size=_as_string(upstream.get("size") or current.get("size")),
+            started_at=_as_string(upstream.get("started_at") or current.get("started_at")),
+            completed_at=_as_string(upstream.get("completed_at") or current.get("completed_at")),
+            project_url=_as_string(upstream.get("project_url") or current.get("project_url")),
+            error=(json.dumps(upstream.get("error"), ensure_ascii=False) if isinstance(upstream.get("error"), dict) else _as_string(upstream.get("error"))),
+            last_poll_at=datetime.now(timezone.utc).isoformat(),
+            poll_failures=0,
+        ) or current
+        if upstream_status in {"failed", "cancelled"}:
+            error_value = upstream.get("error")
+            error_text = (
+                _as_string(error_value.get("message") if isinstance(error_value, dict) else error_value).strip()
+                or "Flow 视频任务未完成"
+            )
+            return await self._flow_video_mark_terminal_failure(
+                updated,
+                error_text,
+                notify=notify_failure,
+            )
+        if upstream_status == "completed" and updated.get("delivery_status") in {"pending", "sending"}:
+            if self.settings.flow_video_auto_send:
+                await self._deliver_flow_video_job(updated, notify_failure=notify_failure)
+            else:
+                self.db.update_flow_video_job(
+                    conversation_id,
+                    job_id,
+                    delivery_status="ready",
+                    error="",
+                )
+            return self.db.get_flow_video_job(conversation_id, job_id) or updated
+        return updated
+
+    async def _deliver_flow_video_job(
+        self,
+        job: Dict[str, Any],
+        *,
+        force: bool = False,
+        notify_failure: bool = True,
+    ) -> Dict[str, Any]:
+        """Download, QQ-transcode and send every completed Flow output once."""
+
+        conversation_id = _as_string(job.get("conversation_id"))
+        job_id = _as_string(job.get("job_id"))
+        if not conversation_id or not job_id:
+            return {"ok": False, "error": "Flow 视频任务记录缺少会话或任务 ID"}
+        lock = self._flow_video_delivery_locks.setdefault(job_id, asyncio.Lock())
+        async with lock:
+            current = self.db.get_flow_video_job(conversation_id, job_id) or job
+            if _as_string(current.get("status")).lower() != "completed":
+                return {"ok": False, "error": "视频尚未生成完成", "retry_safe": True}
+            delivery_status = _as_string(current.get("delivery_status")) or "pending"
+            if delivery_status == "sent" and not force:
+                return {"ok": True, "already_sent": True, **self._flow_video_public_job(current)}
+            if delivery_status == "unknown":
+                return {
+                    "ok": False,
+                    "delivery_unknown": True,
+                    "error": _as_string(current.get("error"))
+                    or "视频发送状态未知；为避免重复发送，服务不会自动补发。",
+                }
+            if delivery_status == "failed" and not force:
+                return {"ok": False, "error": _as_string(current.get("error")) or "视频发送失败，未自动重试"}
+            if not self.adapter or not self.adapter.connected:
+                error = "OneBot 未连接，视频已生成但暂不能发送"
+                self.db.update_flow_video_job(
+                    conversation_id,
+                    job_id,
+                    delivery_status="pending",
+                    error=error,
+                )
+                return {"ok": False, "retry_pending": True, "error": error}
+
+            current = self.db.update_flow_video_job(
+                conversation_id,
+                job_id,
+                delivery_status="sending",
+                error="",
+            ) or current
+            output_count = max(1, min(4, int(current.get("outputs") or 1)))
+            stored_paths = current.get("output_paths") if isinstance(current.get("output_paths"), list) else []
+            stored_message_ids = current.get("delivery_message_ids") if isinstance(current.get("delivery_message_ids"), list) else []
+            local_paths = list(stored_paths)
+            sent_ids = list(stored_message_ids)
+            turn_id = 0
+            try:
+                for index in range(1, output_count + 1):
+                    path_value = _as_string(local_paths[index - 1]) if index - 1 < len(local_paths) else ""
+                    final_path: Optional[Path] = None
+                    if path_value:
+                        candidate = self.workspace.resolve(conversation_id, path_value)
+                        if candidate.is_file() and candidate.stat().st_size > 0:
+                            final_path = candidate
+                    if final_path is None:
+                        safe_job = re.sub(r"[^A-Za-z0-9._-]+", "_", job_id)[:80] or "video"
+                        source_name = ".flow-%s-%s-source.mp4" % (safe_job, index)
+                        source_path = self.workspace.resolve(conversation_id, source_name)
+                        await self._flow_video_client().download_content(job_id, source_path, index=index)
+                        final_path = await self._transcode_video_for_qq(source_path)
+                        relative = final_path.relative_to(self.conversation_workspace(conversation_id)).as_posix()
+                        while len(local_paths) < index:
+                            local_paths.append("")
+                        local_paths[index - 1] = relative
+                        self.db.update_flow_video_job(
+                            conversation_id,
+                            job_id,
+                            output_paths=local_paths,
+                        )
+                    if len(sent_ids) >= index:
+                        continue
+                    if turn_id == 0:
+                        turn_id = self.db.create_turn(conversation_id, [])
+                    sent = await self._send_video_to_conversation(
+                        conversation_id,
+                        final_path,
+                        "flow-%s-%s.mp4" % (re.sub(r"[^A-Za-z0-9._-]+", "_", job_id)[:60] or "video", index),
+                    )
+                    if sent.get("ok") is not True:
+                        detail = _as_string(sent.get("error")) or "视频卡片发送失败"
+                        if sent.get("delivery") == "video_card_uncertain":
+                            unknown_detail = "视频卡片发送结果不确定，已停止自动重试：" + detail
+                            self.db.update_flow_video_job(
+                                conversation_id,
+                                job_id,
+                                delivery_status="unknown",
+                                delivery_message_ids=sent_ids,
+                                output_paths=local_paths,
+                                error=unknown_detail,
+                            )
+                            if turn_id:
+                                self.db.finish_turn(turn_id, "failed", error=unknown_detail)
+                            failed_job = self.db.get_flow_video_job(conversation_id, job_id) or current
+                            self._enqueue_flow_video_failure_event(
+                                failed_job,
+                                unknown_detail,
+                                retry_recommended=False,
+                            )
+                            if notify_failure:
+                                await self._send_flow_video_failure_notice(
+                                    conversation_id, job_id, unknown_detail
+                                )
+                            return {
+                                "ok": False,
+                                "delivery_unknown": True,
+                                "error": unknown_detail,
+                            }
+                        if "OneBot 未连接" in detail:
+                            # No remote request happened; keep the completed
+                            # job pending for the next reconnect.
+                            self.db.update_flow_video_job(
+                                conversation_id,
+                                job_id,
+                                delivery_status="pending",
+                                error=detail,
+                            )
+                            if turn_id:
+                                self.db.finish_turn(turn_id, "cancelled", error=detail)
+                            return {"ok": False, "retry_pending": True, "error": detail}
+                        raise FlowVideoError(detail)
+                    message_id = _as_string(sent.get("message_id"))
+                    if message_id:
+                        sent_ids.append(message_id)
+                        self._record_app_sent_video(
+                            conversation_id,
+                            turn_id,
+                            message_id,
+                            _as_string(sent.get("file")) or final_path.name,
+                        )
+                    while len(sent_ids) < index:
+                        sent_ids.append("")
+                    self.db.update_flow_video_job(
+                        conversation_id,
+                        job_id,
+                        delivery_message_ids=sent_ids,
+                        output_paths=local_paths,
+                    )
+                self.db.update_flow_video_job(
+                    conversation_id,
+                    job_id,
+                    delivery_status="sent",
+                    delivery_message_ids=sent_ids,
+                    output_paths=local_paths,
+                    error="",
+                )
+                if turn_id:
+                    self.db.finish_turn(turn_id, "completed", "Google Flow 视频已自动发送")
+                return {
+                    "ok": True,
+                    "sent": True,
+                    "message_ids": sent_ids,
+                    "output_count": output_count,
+                    "delivery": "video_card",
+                }
+            except FlowVideoError as exc:
+                # A completed status can race the content endpoint by one
+                # request (or the local Flow API can briefly return 5xx/429).
+                # Keep those known-transient cases pending; only a definitive
+                # auth/not-found/format error becomes terminal.
+                if exc.status_code in {408, 425, 429, 500, 502, 503, 504}:
+                    detail = redact_error_detail(exc, limit=2_000)
+                    self.db.update_flow_video_job(
+                        conversation_id,
+                        job_id,
+                        delivery_status="pending",
+                        delivery_message_ids=sent_ids,
+                        output_paths=local_paths,
+                        error=detail,
+                    )
+                    if turn_id:
+                        self.db.finish_turn(turn_id, "cancelled", error=detail)
+                    return {"ok": False, "retry_pending": True, "error": detail}
+                detail = redact_error_detail(exc, limit=2_000)
+                self.db.update_flow_video_job(
+                    conversation_id,
+                    job_id,
+                    delivery_status="failed",
+                    delivery_message_ids=sent_ids,
+                    output_paths=local_paths,
+                    error=detail,
+                )
+                if turn_id:
+                    self.db.finish_turn(turn_id, "failed", error=detail)
+                failed_job = self.db.get_flow_video_job(conversation_id, job_id) or current
+                self._enqueue_flow_video_failure_event(
+                    failed_job,
+                    detail,
+                    retry_recommended=False,
+                )
+                if notify_failure:
+                    await self._send_flow_video_failure_notice(conversation_id, job_id, detail)
+                return {"ok": False, "error": detail, "delivery_failed": True}
+            except Exception as exc:
+                detail = redact_error_detail(exc, limit=2_000)
+                self.db.update_flow_video_job(
+                    conversation_id,
+                    job_id,
+                    delivery_status="failed",
+                    delivery_message_ids=sent_ids,
+                    output_paths=local_paths,
+                    error=detail,
+                )
+                if turn_id:
+                    self.db.finish_turn(turn_id, "failed", error=detail)
+                failed_job = self.db.get_flow_video_job(conversation_id, job_id) or current
+                self._enqueue_flow_video_failure_event(
+                    failed_job,
+                    detail,
+                    retry_recommended=False,
+                )
+                if notify_failure:
+                    await self._send_flow_video_failure_notice(conversation_id, job_id, detail)
+                return {"ok": False, "error": detail, "delivery_failed": True}
+
+    async def _flow_video_monitor_loop(self) -> None:
+        """Poll Flow jobs independently from every group worker."""
+
+        while not self._stopping:
+            try:
+                jobs = self.db.pending_flow_video_jobs(limit=100)
+                for job in jobs:
+                    if self._stopping:
+                        return
+                    group = self.db.get_group(_as_string(job.get("conversation_id")))
+                    # Disabling a conversation stops new collection and does
+                    # not upload/send its existing task until re-enabled.
+                    if not group or not group.get("enabled"):
+                        continue
+                    await self._refresh_flow_video_job(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Flow video monitor poll failed")
+            await asyncio.sleep(max(2, min(60, int(self.settings.flow_video_poll_seconds or 5))))
+
+    async def _execute_flow_video_tool(
+        self,
+        turn_id: int,
+        conversation_id: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        tool_call_id: str,
+        *,
+        operation_slot: int = 0,
+        operation_namespace: str = "",
+    ) -> Dict[str, Any]:
+        """Execute one of the three model-facing asynchronous video tools."""
+
+        if not isinstance(arguments, dict):
+            result = {"ok": False, "retry_safe": True, "error": "工具参数必须是 JSON 对象"}
+            self.db.add_tool_audit(turn_id, conversation_id, tool_call_id, tool_name, {}, result, "failed")
+            return result
+        if tool_name == "Builtin_video_generation_list":
+            unknown = set(arguments).difference({"status", "limit"})
+            if unknown:
+                result = {"ok": False, "retry_safe": True, "error": "Builtin_video_generation_list 包含不允许的参数：" + ", ".join(sorted(unknown))}
+            else:
+                status = _as_string(arguments.get("status")).strip().lower()
+                if status and status not in {"queued", "in_progress", "completed", "failed", "cancelled"}:
+                    result = {"ok": False, "retry_safe": True, "error": "status 只能是 queued、in_progress、completed、failed 或 cancelled"}
+                else:
+                    try:
+                        limit = max(1, min(FLOW_VIDEO_MAX_TASKS_PER_CONVERSATION, int(arguments.get("limit", 10))))
+                    except (TypeError, ValueError):
+                        result = {"ok": False, "retry_safe": True, "error": "limit 必须是整数"}
+                    else:
+                        rows = self.db.list_flow_video_jobs(conversation_id, status=status, limit=limit)
+                        for row in rows:
+                            if _as_string(row.get("status")) not in FLOW_VIDEO_TERMINAL_STATUSES:
+                                await self._refresh_flow_video_job(row, notify_failure=False)
+                        rows = self.db.list_flow_video_jobs(conversation_id, status=status, limit=limit)
+                        result = {
+                            "ok": True,
+                            "current_conversation_only": True,
+                            "tasks": [self._flow_video_public_job(row) for row in rows],
+                            "count": len(rows),
+                        }
+            status_value = "success" if result.get("ok") is True else "failed"
+            self.db.add_tool_audit(turn_id, conversation_id, tool_call_id, tool_name, arguments, result, status_value)
+            return result
+
+        if tool_name == "Builtin_video_generation_result":
+            unknown = set(arguments).difference({"job_id", "send"})
+            job_id = _as_string(arguments.get("job_id")).strip()
+            if unknown:
+                result = {"ok": False, "retry_safe": True, "error": "Builtin_video_generation_result 包含不允许的参数：" + ", ".join(sorted(unknown))}
+            elif not job_id or len(job_id) > 200:
+                result = {"ok": False, "retry_safe": True, "error": "job_id 不能为空且最多 200 个字符"}
+            else:
+                job = self.db.get_flow_video_job(conversation_id, job_id)
+                if not job:
+                    result = {"ok": False, "retry_safe": True, "current_conversation_only": True, "error": "当前会话不存在该视频任务；不能查询其他群或私聊任务"}
+                else:
+                    job = await self._refresh_flow_video_job(job, notify_failure=False)
+                    if bool(arguments.get("send", False)) and _as_string(job.get("status")) == "completed":
+                        delivery_result = await self._deliver_flow_video_job(job, force=True, notify_failure=False)
+                        job = self.db.get_flow_video_job(conversation_id, job_id) or job
+                    else:
+                        delivery_result = None
+                    result = {"ok": True, "current_conversation_only": True, **self._flow_video_public_job(job)}
+                    if isinstance(delivery_result, dict) and delivery_result.get("ok") is not True:
+                        result["send_error"] = delivery_result.get("error") or "视频发送未完成"
+            status_value = "success" if result.get("ok") is True else "failed"
+            self.db.add_tool_audit(turn_id, conversation_id, tool_call_id, tool_name, arguments, result, status_value)
+            return result
+
+        if tool_name != "Builtin_video_generation_create":
+            result = {"ok": False, "retry_safe": True, "error": "不允许的 Flow 视频工具"}
+            self.db.add_tool_audit(turn_id, conversation_id, tool_call_id, tool_name, arguments, result, "failed")
+            return result
+
+        allowed = {"prompt", "model", "seconds", "size", "n", "input_reference", "max_credits"}
+        unknown = set(arguments).difference(allowed)
+        try:
+            if unknown:
+                raise ValueError("Builtin_video_generation_create 包含不允许的参数：" + ", ".join(sorted(unknown)))
+            prompt = _as_string(arguments.get("prompt")).strip()
+            if not prompt:
+                raise ValueError("prompt 不能为空")
+            if len(prompt) > FLOW_VIDEO_MAX_PROMPT_CHARS:
+                raise ValueError("prompt 最多 4000 个字符")
+            requested_model = _as_string(arguments.get("model") or FLOW_VIDEO_MODEL).strip()
+            model_key = requested_model.casefold().replace("–", "-").replace("—", "-")
+            if model_key in FLOW_VIDEO_MODEL_ALIASES:
+                model = FLOW_VIDEO_MODEL
+            else:
+                model = requested_model
+            if len(model) > FLOW_VIDEO_MAX_MODEL_CHARS:
+                raise ValueError("model 名称过长")
+            if model != FLOW_VIDEO_MODEL:
+                raise ValueError(
+                    "Flow 视频固定使用 Gemini Omni Flash 1.1（gemini-omni-flash），不支持 Veo 3.1 或其他模型"
+                )
+            seconds = int(arguments.get("seconds", 8))
+            if seconds not in {4, 6, 8, 10}:
+                raise ValueError("seconds 只能是 4、6、8 或 10")
+            size = _as_string(arguments.get("size") or "1280x720").strip()
+            if size not in {"1280x720", "1792x1024", "1920x1080", "720x1280", "1024x1792", "1080x1920", "16:9", "9:16"}:
+                raise ValueError("size 必须是支持的 16:9 或 9:16 尺寸")
+            outputs = int(arguments.get("n", 1))
+            if not 1 <= outputs <= 4:
+                raise ValueError("n 必须在 1 到 4 之间")
+            max_credits = arguments.get("max_credits")
+            if max_credits is not None:
+                max_credits = int(max_credits)
+                if max_credits < 1:
+                    raise ValueError("max_credits 必须是正整数")
+            input_reference = self._flow_video_job_reference_path(conversation_id, arguments.get("input_reference"))
+        except (TypeError, ValueError, WorkspaceError) as exc:
+            result = {"ok": False, "retry_safe": True, "flow_video": True, "error": str(exc), "retry_safe_reason": "本地参数校验失败，未向 Flow API 提交任务。"}
+            self.db.add_tool_audit(turn_id, conversation_id, tool_call_id, tool_name, arguments, result, "failed")
+            return result
+
+        operation_key, event_ids = self._tool_operation_key(
+            turn_id,
+            conversation_id,
+            operation_slot,
+            operation_namespace=operation_namespace,
+        )
+        previous_operation = self.db.reserve_tool_operation(
+            operation_key,
+            conversation_id,
+            event_ids,
+            tool_name,
+            arguments,
+        )
+        if previous_operation is not None:
+            previous_result = json_loads(previous_operation.get("result_json"), {})
+            # A known Flow 4xx is a pre-action validation failure.  It is safe
+            # to replace that reservation for this correction slot; timeouts,
+            # 5xx responses and accepted tasks remain permanently deduplicated.
+            if (
+                isinstance(previous_result, dict)
+                and previous_result.get("retry_safe") is True
+                and previous_operation.get("status") == "failed"
+            ):
+                self.db.release_retryable_tool_operation(operation_key)
+                previous_operation = self.db.reserve_tool_operation(
+                    operation_key,
+                    conversation_id,
+                    event_ids,
+                    tool_name,
+                    arguments,
+                )
+        if previous_operation is not None:
+            result = json_loads(previous_operation.get("result_json"), {"ok": False, "error": "此前 Flow 视频任务提交结果未知；为避免重复创建，未再次提交。"})
+            if not isinstance(result, dict):
+                result = {"ok": False, "error": "此前 Flow 视频提交记录损坏；为避免重复创建，未再次提交。"}
+            result = dict(result)
+            result["deduplicated"] = True
+            self.db.add_tool_audit(turn_id, conversation_id, tool_call_id, tool_name, arguments, result, "deduplicated")
+            return result
+
+        normalized_arguments = {
+            "prompt": prompt,
+            "model": model,
+            "seconds": seconds,
+            "size": size,
+            # The public tool schema calls this field ``n`` to match the
+            # OpenAI-style video request, while FlowVideoClient.create uses
+            # the explicit Python keyword ``outputs`` and serializes it back
+            # to ``n`` on the wire.  Passing ``n`` here raises
+            # ``unexpected keyword argument 'n'`` before any HTTP request.
+            "outputs": outputs,
+        }
+        if input_reference:
+            normalized_arguments["input_reference"] = input_reference
+        if max_credits is not None:
+            normalized_arguments["max_credits"] = max_credits
+        status_value = "failed"
+        try:
+            upstream = await self._flow_video_client().create(**normalized_arguments)
+            job_id = _as_string(upstream.get("id")).strip()
+            if not job_id:
+                raise FlowVideoError("Flow API 接受请求但没有返回任务 ID")
+            seconds_result = upstream.get("seconds", seconds)
+            try:
+                seconds_result = int(seconds_result)
+            except (TypeError, ValueError):
+                seconds_result = seconds
+            created = self.db.create_flow_video_job(
+                conversation_id,
+                job_id,
+                prompt=prompt,
+                model=_as_string(upstream.get("model") or model),
+                seconds=seconds_result,
+                size=_as_string(upstream.get("size") or size),
+                outputs=int(upstream.get("output_count") or outputs),
+                status=_as_string(upstream.get("status") or "queued"),
+                progress=int(upstream.get("progress") or 0),
+                created_at=_as_string(upstream.get("created_at")),
+                started_at=_as_string(upstream.get("started_at")),
+                completed_at=_as_string(upstream.get("completed_at")),
+                project_url=_as_string(upstream.get("project_url")),
+                error=(json.dumps(upstream.get("error"), ensure_ascii=False) if isinstance(upstream.get("error"), dict) else _as_string(upstream.get("error"))),
+            )
+            notice = await self._send_flow_video_acceptance_notice(
+                turn_id,
+                conversation_id,
+                job_id,
+                status=_as_string(created.get("status")) or "queued",
+            )
+            result = {
+                "ok": True,
+                "flow_video": True,
+                "async": True,
+                "accepted": True,
+                "message": "视频生成任务已创建，后台完成后会自动发送视频；当前轮不等待生成。",
+                **self._flow_video_public_job(created),
+            }
+            if notice.get("ok") is not True:
+                result["activity_notice_warning"] = notice.get("error", "视频生成任务确认未发送")
+            elif notice.get("message_id"):
+                result["acceptance_message_id"] = notice.get("message_id")
+            status_value = "success"
+        except FlowVideoError as exc:
+            result = self._flow_video_error_result(
+                exc,
+                retry_safe=exc.status_code in {400, 404, 409},
+            )
+        except Exception as exc:
+            result = self._flow_video_error_result(exc)
+        self.db.finish_tool_operation(operation_key, status_value, result)
+        self.db.add_tool_audit(turn_id, conversation_id, tool_call_id, tool_name, arguments, result, status_value)
+        return result
 
     def _rolling_summary_candidates(self, conversation_id: str, *, limit: int = 16) -> List[str]:
         """Return recent private rolling summaries for the outbound leak gate.
@@ -5507,7 +6945,29 @@ class AgentService:
             status = "success" if result.get("ok") is True else "failed"
             self.db.add_tool_audit(turn_id, group_id, tool_call_id, tool_name, arguments, result, status)
             return result
-        if not self.adapter or not self.adapter.connected:
+        if tool_name in FLOW_VIDEO_TOOL_NAMES:
+            # Flow creation/status lives in a separate local process and must
+            # remain usable even while OneBot is reconnecting.  The completed
+            # job's automatic delivery is retried by the independent monitor.
+            return await self._execute_flow_video_tool(
+                turn_id,
+                group_id,
+                tool_name,
+                arguments,
+                tool_call_id,
+                operation_slot=operation_slot,
+                operation_namespace=operation_namespace,
+            )
+        # Video download tools only write the current workspace.  They do not
+        # need a live OneBot connection; keeping them available during a QQ
+        # reconnect lets the Agent inspect the result before deciding whether
+        # to send anything.  All other tools below may change QQ state and
+        # still require the adapter.
+        workspace_download_tool = tool_name in {
+            "Builtin_bilibili_download",
+            "Builtin_youtube_download",
+        }
+        if not workspace_download_tool and (not self.adapter or not self.adapter.connected):
             result = {"ok": False, "error": "OneBot 未连接"}
             self.db.add_tool_audit(turn_id, group_id, tool_call_id, tool_name, arguments, result, "failed")
             return result
@@ -5743,7 +7203,7 @@ class AgentService:
         message_id = ""
         try:
             if tool_name == "send_group_message":
-                text = _as_string(effective_arguments.get("text")).strip()
+                text = normalise_qq_plain_text(effective_arguments.get("text")).strip()
                 if not text:
                     raise ValueError("text 不能为空")
                 if len(text) > MAX_QQ_TEXT_CHARS:
@@ -6000,12 +7460,6 @@ class AgentService:
                     # sentence.
                     status = "failed"
                 else:
-                    message_id = _as_string(result.get("message_id"))
-                    filename = _as_string(result.get("file"))
-                    if result.get("delivery") == "video_card":
-                        self._record_app_sent_video(group_id, turn_id, message_id, filename)
-                    else:
-                        self._record_app_sent_file(group_id, turn_id, message_id, filename)
                     status = "success"
 
             elif tool_name == "Builtin_youtube_download":
@@ -6013,12 +7467,6 @@ class AgentService:
                 if result.get("ok") is not True:
                     status = "failed"
                 else:
-                    message_id = _as_string(result.get("message_id"))
-                    filename = _as_string(result.get("file"))
-                    if result.get("delivery") == "video_card":
-                        self._record_app_sent_video(group_id, turn_id, message_id, filename)
-                    else:
-                        self._record_app_sent_file(group_id, turn_id, message_id, filename)
                     status = "success"
 
             elif tool_name == "Builtin_music_download":
@@ -6056,6 +7504,14 @@ class AgentService:
                 raise ValueError("不允许的工具：" + tool_name)
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}
+            if workspace_download_tool:
+                result.update(
+                    {
+                        "retry_safe": True,
+                        "qq_side_effect": False,
+                        "retry_safe_reason": "视频下载只写入当前工作区，未发送 QQ；可根据错误修正参数后重试。",
+                    }
+                )
             if tool_name in _SAFE_FINALIZATION_NOTICE_TOOLS:
                 result["safe_to_notify_user"] = True
         self.db.finish_tool_operation(operation_key, status, result)
@@ -6202,7 +7658,19 @@ class AgentService:
                     "untrusted_data": True,
                 }
             raise ValueError("不允许的只读工具：" + tool_name)
-        except (ValueError, WebToolError) as exc:
+        except WebToolError as exc:
+            diagnostic = exc.diagnostic()
+            return {
+                "ok": False,
+                "retry_safe": True,
+                "retry_safe_reason": "只读工具未产生 QQ 状态变化；可根据错误修正一次。",
+                "error": redact_error_detail(exc, limit=1_200),
+                "diagnostic": diagnostic,
+                "provider": diagnostic.get("provider") or "",
+                "verified": False,
+                "attempts": [],
+            }
+        except ValueError as exc:
             return {
                 "ok": False,
                 "retry_safe": True,
@@ -6230,6 +7698,7 @@ class AgentService:
             "onebot_connected": self.onebot_connected,
             "enabled_group_count": self.db.enabled_group_count(),
             "pending_event_count": self.db.pending_event_count(),
+            "flow_video_pending_count": len(self.db.pending_flow_video_jobs(limit=1_000)),
             "media_usage_bytes": usage,
             "media_usage_label": self._format_bytes(usage),
             "runtime_warning": runtime_warning,

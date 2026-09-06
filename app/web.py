@@ -20,6 +20,7 @@ from fastapi.templating import Jinja2Templates
 
 from .onebot import OneBotAuthenticationError
 from .service import AgentService
+from .terminal import execute_command as execute_terminal_command, help_text as terminal_help_text
 
 
 logger = logging.getLogger(__name__)
@@ -418,6 +419,56 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     async def healthz() -> Dict[str, Any]:
         return {"ok": True, **service.dashboard_state()}
 
+    @app.get("/terminal/help")
+    async def terminal_help() -> Dict[str, Any]:
+        """Return the same Chinese command help shown by console.ps1.
+
+        This endpoint is intentionally loopback-only through the middleware;
+        the mutating command endpoint below additionally requires an explicit
+        terminal header so a browser page cannot accidentally submit a line.
+        """
+
+        return {"ok": True, "help": terminal_help_text()}
+
+    @app.post("/terminal/command")
+    async def terminal_command(request: Request) -> JSONResponse:
+        """Execute one built-in operator command from the local terminal.
+
+        The endpoint does not expose an arbitrary shell. It dispatches only
+        the bounded command table in :mod:`app.terminal`; all commands still
+        use the service's existing group scoping and async locks.
+        """
+
+        if request.headers.get("x-qqai-terminal", "") != "1":
+            raise HTTPException(status_code=403, detail="该接口只接受本机终端客户端请求。")
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="终端命令请求必须是 JSON 对象。") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("command"), str):
+            raise HTTPException(status_code=400, detail="终端命令请求缺少 command 字符串。")
+        command = payload["command"]
+        if len(command) > 20_000:
+            raise HTTPException(status_code=400, detail="单条终端命令最多 20,000 个字符。")
+        try:
+            result = await execute_terminal_command(service, command)
+            # Windows PowerShell 5 assumes a legacy code page when JSON has no
+            # charset. Explicit UTF-8 keeps Chinese help/output readable in
+            # both Windows PowerShell and pwsh.
+            return JSONResponse(
+                result.as_dict(),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+        except Exception as exc:
+            logger.exception("terminal command failed: %s", command[:200])
+            # Keep command errors inside the console loop. A typo, an unknown
+            # group, or an upstream timeout must not terminate the server or
+            # make the PowerShell client look hung.
+            return JSONResponse(
+                {"ok": False, "error": str(exc) or "终端命令执行失败。"},
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+
     @app.post("/settings")
     async def save_settings(request: Request) -> RedirectResponse:
         form = await require_form_csrf(request)
@@ -434,7 +485,11 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             "global_prompt": _form_value(form, "global_prompt"),
             "media_budget_gib": _form_value(form, "media_budget_gib"),
             "onebot_token": _form_value(form, "onebot_token"),
+            "flow_video_api_url": _form_value(form, "flow_video_api_url"),
+            "flow_video_poll_seconds": _form_value(form, "flow_video_poll_seconds"),
         }
+        if form.get("flow_video_auto_send") is not None:
+            values["flow_video_auto_send"] = _checkbox(form.get("flow_video_auto_send"))
         try:
             await service.update_settings(values)
         except Exception as exc:

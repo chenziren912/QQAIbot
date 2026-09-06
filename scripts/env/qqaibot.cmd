@@ -4,6 +4,8 @@ setlocal
 rem PowerShell may block .ps1 files before the script can print its own
 rem diagnostics.  This wrapper applies a process-only bypass and forwards all
 rem arguments, without changing the user's machine-wide execution policy.
+rem The compatibility entry point forwards to the canonical script, including
+rem automatic Google Flow API startup/watchdog and the -NoFlowApi switch.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1" %*
 set "exit_code=%ERRORLEVEL%"
 if not "%exit_code%"=="0" (

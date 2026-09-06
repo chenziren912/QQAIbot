@@ -59,7 +59,7 @@ async def test_invalid_model_summary_rolls_back_and_recomputes_archive_interval(
     # remains a live decision.  The failed turn must consume the live event
     # (no action replay) and recompute the old interval as archive-only.
     old_id = service.db.insert_event(
-        normalise_onebot_event(_message("old", "旧消息" * 20_000, 1))
+        normalise_onebot_event(_message("old", "旧消息" * 60_000, 1))
     )
     current_id = service.db.insert_event(
         normalise_onebot_event(_message("current", "当前消息", 2))
@@ -123,7 +123,7 @@ async def test_google_safety_refusal_retries_without_raw_content_or_qq_actions(
     service.db.set_group_config("100", True)
     service.db.set_group_initialized("100", True)
 
-    old = normalise_onebot_event(_message("old", "敏感原文" * 20_000, 1))
+    old = normalise_onebot_event(_message("old", "敏感原文" * 40_000, 1))
     old["pending"] = False
     old_id = service.db.insert_event(old)
     current_id = service.db.insert_event(normalise_onebot_event(_message("current", "当前消息", 2)))

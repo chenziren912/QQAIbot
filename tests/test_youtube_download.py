@@ -22,6 +22,16 @@ class FailedProcess:
         )
 
 
+class SuccessfulProcess:
+    returncode = 0
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    async def communicate(self):
+        return (str(self.path).encode("utf-8"), b"")
+
+
 @pytest.mark.asyncio
 async def test_bilibili_download_preserves_provider_diagnostic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -177,6 +187,41 @@ async def test_youtube_download_query_uses_ytsearch_without_websearch(
     assert captured["command"][captured["command"].index("--js-runtimes") + 1] == (
         r"node:C:\Program Files\nodejs\node.exe"
     )
+
+
+@pytest.mark.asyncio
+async def test_video_download_can_finish_without_onebot_and_never_sends_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace-only download must not be blocked by a QQ reconnect."""
+
+    workspace_root = tmp_path / "Workspace"
+    monkeypatch.setenv("QQ_AI_WORKSPACE_ROOT", str(workspace_root))
+    service = AgentService(tmp_path / "data")
+    video = service.conversation_workspace("private:1") / "downloaded.mp4"
+    video.write_bytes(b"mp4")
+
+    async def fake_create(*_: object, **__: object) -> SuccessfulProcess:
+        return SuccessfulProcess(video)
+
+    monkeypatch.setattr("app.service.asyncio.create_subprocess_exec", fake_create)
+    monkeypatch.setattr("app.service._windows_configured_https_proxy", lambda: "")
+    try:
+        turn_id = service.db.create_turn("private:1", [])
+        result = await service._execute_tool(
+            turn_id,
+            "private:1",
+            "Builtin_youtube_download",
+            {"url": "https://www.youtube.com/watch?v=jNQXAC9IVRw"},
+            "download-no-onebot",
+        )
+    finally:
+        await service.stop()
+
+    assert result["ok"] is True
+    assert result["delivery"] == "workspace"
+    assert result["sent"] is False
+    assert result["path"] == "downloaded.mp4"
 
 
 def test_youtube_url_validation_accepts_official_hosts_only() -> None:

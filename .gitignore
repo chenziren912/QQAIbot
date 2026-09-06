@@ -6,7 +6,18 @@ __pycache__/
 data/
 data/api-key.json
 data/bilibili-cookies.txt
+data/youtube-cookies.txt
+data/google-search-cookies.txt
+data/google-cookies.txt
+data/*cookie*
+data/*storage-state*.json
 api-key.json
 *.sqlite3
 *.db
 .env
+
+# Never commit exported browser sessions or credential-bearing cookie files,
+# even if they are accidentally placed outside the runtime data directory.
+*cookie*.txt
+*cookie*.json
+*storage-state*.json

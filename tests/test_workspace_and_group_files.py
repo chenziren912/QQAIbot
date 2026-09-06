@@ -169,6 +169,39 @@ async def test_file_tools_command_and_group_file_download(tmp_path: Path, monkey
 
 
 @pytest.mark.asyncio
+async def test_command_activity_preview_and_periodic_throttle(tmp_path: Path) -> None:
+    service = AgentService(tmp_path / "data")
+    service.db.upsert_group("123", "测试群")
+    adapter = FakeAdapter(tmp_path / "unused")
+    service.adapter = adapter
+    turn_id = service.db.create_turn("123", [])
+    command = "powershell -NoProfile -Command " + ("x" * 100)
+    display = " ".join(command.split())
+
+    for _ in range(9):
+        result = await service._send_command_activity_notice(turn_id, "123", command)
+        assert result["command_count"] <= 9
+
+    messages = [
+        call[1]["message"][0]["data"]["text"]
+        for call in adapter.calls
+        if call[0] == "send_group_msg"
+    ]
+    assert messages == [
+        "正在执行指令：" + display[:30] + "…",
+        "正在执行指令：" + display[:30] + "…",
+        "正在执行指令：" + display[:30] + "…",
+        "正在执行命令，已执行6次",
+        "正在执行命令，已执行9次",
+    ]
+
+    # A new Agent turn starts a new three-call cadence.
+    next_turn = service.db.create_turn("123", [])
+    await service._send_command_activity_notice(next_turn, "123", "echo ok")
+    assert adapter.calls[-1][1]["message"][0]["data"]["text"] == "正在执行指令：echo ok"
+
+
+@pytest.mark.asyncio
 async def test_group_files_use_napcat_group_file_url_before_cached_get_file(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -219,3 +252,9 @@ def test_new_tools_are_available_in_chat_and_responses() -> None:
     }
     assert expected <= names
     assert expected <= {tool["name"] for tool in responses_tools()}
+    descriptions = {
+        tool["function"]["name"]: tool["function"].get("description", "")
+        for tool in TOOLS
+    }
+    assert "不发送 QQ" in descriptions["Builtin_bilibili_download"]
+    assert "不发送 QQ" in descriptions["Builtin_youtube_download"]

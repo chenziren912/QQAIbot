@@ -17,6 +17,7 @@ from app.markdown_render import (
     _detect_markflow_root,
     _find_browser,
     _is_transient_cdp_context_error,
+    MARKFLOW_PREVIEW_CSS,
     render_markdown_images,
 )
 from app.service import AgentService, normalise_onebot_event
@@ -76,6 +77,14 @@ def test_markdown_image_tool_is_exposed_for_completions_and_responses() -> None:
     assert "KaTeX" in completion["function"]["description"]
     response = next(item for item in responses_tools() if item["name"] == "Builtin_render_markdown_image")
     assert response["parameters"]["required"] == ["markdown"]
+
+
+def test_markdown_tables_wrap_long_content_instead_of_clipping() -> None:
+    assert "table-layout:fixed" in MARKFLOW_PREVIEW_CSS
+    assert "width:100%" in MARKFLOW_PREVIEW_CSS
+    assert "overflow-x:auto" in MARKFLOW_PREVIEW_CSS
+    assert "overflow-wrap:anywhere" in MARKFLOW_PREVIEW_CSS
+    assert "word-break:break-word" in MARKFLOW_PREVIEW_CSS
 
 
 @pytest.mark.asyncio

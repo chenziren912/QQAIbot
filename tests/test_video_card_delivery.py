@@ -1,4 +1,4 @@
-"""Downloaded Bilibili videos must be QQ video cards, not generic files."""
+"""Workspace video downloads stay local until the Agent explicitly sends them."""
 
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ class DownloadedVideoProcess:
 
 
 @pytest.mark.asyncio
-async def test_bilibili_download_delivers_mp4_as_video_card(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_bilibili_download_stores_mp4_without_qq_send(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     workspace_root = tmp_path / "Workspace"
     monkeypatch.setenv("QQ_AI_WORKSPACE_ROOT", str(workspace_root))
     service = AgentService(tmp_path / "data")
@@ -133,7 +133,11 @@ async def test_bilibili_download_delivers_mp4_as_video_card(tmp_path: Path, monk
         await service.stop()
 
     assert result["ok"] is True
-    assert result["delivery"] == "video_card"
+    assert result["delivery"] == "workspace"
+    assert result["sent"] is False
+    assert result["qq_side_effect"] is False
+    assert result["path"] == "downloaded.mp4"
+    assert result["filename"] == "downloaded.mp4"
     video_calls = [
         params
         for action, params in adapter.calls
@@ -142,16 +146,15 @@ async def test_bilibili_download_delivers_mp4_as_video_card(tmp_path: Path, monk
         and params["message"]
         and params["message"][0].get("type") == "video"
     ]
-    assert len(video_calls) == 1
-    assert video_calls[0]["message"][0]["data"]["file"] == str(video)
+    assert not video_calls
     assert not [call for call in adapter.calls if call[0] == "upload_group_file"]
 
 
 @pytest.mark.asyncio
-async def test_bilibili_download_transcodes_non_qq_video_before_card(
+async def test_bilibili_download_keeps_original_container_until_explicit_send(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The downloaded container/codec is normalized before QQ delivery."""
+    """Download must not create a second QQ-compatible file or send it early."""
 
     workspace_root = tmp_path / "Workspace"
     monkeypatch.setenv("QQ_AI_WORKSPACE_ROOT", str(workspace_root))
@@ -159,20 +162,17 @@ async def test_bilibili_download_transcodes_non_qq_video_before_card(
     service.db.upsert_group("123", "视频群")
     source = service.conversation_workspace("123") / "downloaded.webm"
     source.write_bytes(b"webm")
-    compatible = service.conversation_workspace("123") / "downloaded.qq.mp4"
-    compatible.write_bytes(b"h264-aac-mp4")
     adapter = Adapter()
     service.adapter = adapter  # type: ignore[assignment]
 
     async def fake_create(*_: object, **__: object) -> DownloadedVideoProcess:
         return DownloadedVideoProcess(source)
 
-    async def fake_transcode(path: Path) -> Path:
-        assert path == source
-        return compatible
+    async def fail_if_transcoded(path: Path) -> Path:
+        raise AssertionError("download tool must not transcode before explicit send_group_file")
 
     monkeypatch.setattr("app.service.asyncio.create_subprocess_exec", fake_create)
-    monkeypatch.setattr(service, "_transcode_video_for_qq", fake_transcode)
+    monkeypatch.setattr(service, "_transcode_video_for_qq", fail_if_transcoded)
     monkeypatch.setattr("app.service._windows_configured_https_proxy", lambda: "")
     try:
         result = await service._bilibili_download(
@@ -182,16 +182,19 @@ async def test_bilibili_download_transcodes_non_qq_video_before_card(
         await service.stop()
 
     assert result["ok"] is True
-    assert result["qq_compatible"] is True
+    assert result["delivery"] == "workspace"
+    assert result["sent"] is False
+    assert result["path"] == "downloaded.webm"
     video_calls = [
         params for action, params in adapter.calls
         if action == "send_group_msg" and params.get("message", [{}])[0].get("type") == "video"
     ]
-    assert video_calls[0]["message"][0]["data"]["file"] == str(compatible)
+    assert not video_calls
+    assert not [call for call in adapter.calls if call[0] == "upload_group_file"]
 
 
 @pytest.mark.asyncio
-async def test_bilibili_audio_only_keeps_normal_file_delivery(
+async def test_bilibili_audio_only_stays_in_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace_root = tmp_path / "Workspace"
@@ -220,7 +223,9 @@ async def test_bilibili_audio_only_keeps_normal_file_delivery(
         await service.stop()
 
     assert result["ok"] is True
-    assert result["delivery"] == "file"
+    assert result["delivery"] == "workspace"
+    assert result["sent"] is False
+    assert result["path"] == "downloaded.m4a"
     assert not [
         call
         for call in adapter.calls
@@ -229,4 +234,4 @@ async def test_bilibili_audio_only_keeps_normal_file_delivery(
         and call[1]["message"]
         and call[1]["message"][0].get("type") == "video"
     ]
-    assert [call for call in adapter.calls if call[0] == "upload_group_file"]
+    assert not [call for call in adapter.calls if call[0] == "upload_group_file"]

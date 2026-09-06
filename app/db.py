@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -229,6 +230,42 @@ class Database:
                     recalled INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
+                -- Google Flow video jobs are asynchronous.  The upstream
+                -- browser/API process may be restarted and lose its in-memory
+                -- job map, so keep the originating conversation and delivery
+                -- state locally.  A job is always queried and delivered only
+                -- for this conversation; the service never trusts an
+                -- upstream list to select another QQ target.
+                CREATE TABLE IF NOT EXISTS flow_video_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    prompt TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    seconds INTEGER NOT NULL DEFAULT 8,
+                    size TEXT NOT NULL DEFAULT '1280x720',
+                    outputs INTEGER NOT NULL DEFAULT 1,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    retry_of_job_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT NOT NULL DEFAULT '',
+                    completed_at TEXT NOT NULL DEFAULT '',
+                    project_url TEXT NOT NULL DEFAULT '',
+                    output_paths_json TEXT NOT NULL DEFAULT '[]',
+                    error TEXT NOT NULL DEFAULT '',
+                    delivery_status TEXT NOT NULL DEFAULT 'pending',
+                    delivery_message_ids_json TEXT NOT NULL DEFAULT '[]',
+                    last_poll_at TEXT NOT NULL DEFAULT '',
+                    poll_failures INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(conversation_id, job_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_flow_video_jobs_pending
+                    ON flow_video_jobs(delivery_status, status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_flow_video_jobs_conversation
+                    ON flow_video_jobs(conversation_id, created_at DESC, id DESC);
                 -- There is deliberately no group/conversation identifier:
                 -- this is the one local operator-to-agent conversation shown
                 -- in the loopback dashboard.  It never mixes with QQ data.
@@ -356,6 +393,18 @@ class Database:
                 # extraction worker can backfill them with the same retryable
                 # cursor used for new messages; no old evidence is forgotten.
                 conn.execute("ALTER TABLE events ADD COLUMN memory_processed INTEGER NOT NULL DEFAULT 0")
+            flow_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(flow_video_jobs)").fetchall()
+            }
+            if "retry_count" not in flow_columns:
+                conn.execute(
+                    "ALTER TABLE flow_video_jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "retry_of_job_id" not in flow_columns:
+                conn.execute(
+                    "ALTER TABLE flow_video_jobs ADD COLUMN retry_of_job_id TEXT NOT NULL DEFAULT ''"
+                )
             # This must happen after the legacy-column migration: SQLite runs
             # CREATE INDEX immediately, and an old installation otherwise
             # fails before it reaches the safe ALTER TABLE above.
@@ -576,33 +625,107 @@ class Database:
     # Events and summaries
     def insert_event(self, event: Dict[str, Any]) -> Optional[int]:
         now = utc_now()
-        with self.transaction() as conn:
-            cursor = conn.execute(
+        values = (
+            event["dedupe_key"],
+            str(event["group_id"]),
+            event.get("event_type", "unknown"),
+            event.get("sub_type", ""),
+            str(event.get("message_id", "")),
+            int(event.get("occurred_at", 0) or 0),
+            str(event.get("sender_id", "")),
+            event.get("sender_name", ""),
+            str(event.get("self_id", "")),
+            event.get("normalized_text", ""),
+            json_dumps(event.get("content", {})),
+            json_dumps(event.get("raw", {})),
+            int(bool(event.get("is_self", False))),
+            int(bool(event.get("pending", True))),
+            int(bool(event.get("archived", False))),
+            int(bool(event.get("memory_processed", False))),
+            now,
+        )
+
+        def insert_with_key(conn: sqlite3.Connection, key: str) -> sqlite3.Cursor:
+            row_values = (key, *values[1:])
+            return conn.execute(
                 """INSERT OR IGNORE INTO events(
                     dedupe_key, group_id, event_type, sub_type, message_id, occurred_at, sender_id, sender_name,
                     self_id, normalized_text, content_json, raw_json, is_self, pending, archived,
                     memory_processed, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    event["dedupe_key"],
-                    str(event["group_id"]),
-                    event.get("event_type", "unknown"),
-                    event.get("sub_type", ""),
-                    str(event.get("message_id", "")),
-                    int(event.get("occurred_at", 0) or 0),
-                    str(event.get("sender_id", "")),
-                    event.get("sender_name", ""),
-                    str(event.get("self_id", "")),
-                    event.get("normalized_text", ""),
-                    json_dumps(event.get("content", {})),
-                    json_dumps(event.get("raw", {})),
-                    int(bool(event.get("is_self", False))),
-                    int(bool(event.get("pending", True))),
-                    int(bool(event.get("archived", False))),
-                    int(bool(event.get("memory_processed", False))),
-                    now,
-                ),
+                row_values,
             )
+
+        # OneBot message IDs are not guaranteed to be globally unique.  In
+        # particular, some QQ clients reuse negative IDs after a reconnect or
+        # process restart.  Keep the original key for normal history/live
+        # deduplication, but never discard a genuinely different event merely
+        # because an older row happens to use the same key.  The collision key
+        # is deterministic, so retrying the same payload still deduplicates.
+        collision_identity = {
+            "group_id": str(event.get("group_id", "")),
+            "message_id": str(event.get("message_id", "")),
+            "occurred_at": int(event.get("occurred_at", 0) or 0),
+            "sender_id": str(event.get("sender_id", "")),
+            "normalized_text": str(event.get("normalized_text", "")),
+            "content": dict(event.get("content") or {}) if isinstance(event.get("content"), Mapping) else {},
+        }
+        # These flags intentionally differ between history backfill and live
+        # delivery of the same OneBot message and must not defeat deduplication.
+        for flag in (
+            "history",
+            "live_direct_mention",
+            "live_clear_group_call",
+            "live_explicit_agent_task_request",
+            "live_reply_to_bot",
+        ):
+            collision_identity["content"].pop(flag, None)
+        collision_digest = hashlib.sha256(json_dumps(collision_identity).encode("utf-8")).hexdigest()[:24]
+
+        def row_identity(row: sqlite3.Row | None) -> Dict[str, Any]:
+            if row is None:
+                return {}
+            content = json_loads(row["content_json"], {})
+            if not isinstance(content, Mapping):
+                content = {}
+            content = dict(content)
+            for flag in (
+                "history",
+                "live_direct_mention",
+                "live_clear_group_call",
+                "live_explicit_agent_task_request",
+                "live_reply_to_bot",
+            ):
+                content.pop(flag, None)
+            return {
+                "group_id": str(row["group_id"] or ""),
+                "message_id": str(row["message_id"] or ""),
+                "occurred_at": int(row["occurred_at"] or 0),
+                "sender_id": str(row["sender_id"] or ""),
+                "normalized_text": str(row["normalized_text"] or ""),
+                "content": content,
+            }
+
+        with self.transaction() as conn:
+            cursor = insert_with_key(conn, str(event["dedupe_key"]))
+            if cursor.rowcount == 0:
+                existing = conn.execute(
+                    "SELECT group_id, message_id, occurred_at, sender_id, normalized_text, content_json "
+                    "FROM events WHERE dedupe_key = ?",
+                    (str(event["dedupe_key"]),),
+                ).fetchone()
+                if existing is not None and row_identity(existing) == collision_identity:
+                    return None
+                collision_key = f"{event['dedupe_key']}:collision:{collision_digest}"
+                cursor = insert_with_key(conn, collision_key)
+                if cursor.rowcount == 0:
+                    existing_collision = conn.execute(
+                        "SELECT group_id, message_id, occurred_at, sender_id, normalized_text, content_json "
+                        "FROM events WHERE dedupe_key = ?",
+                        (collision_key,),
+                    ).fetchone()
+                    if existing_collision is not None and row_identity(existing_collision) == collision_identity:
+                        return None
             if cursor.rowcount == 0:
                 return None
             return int(cursor.lastrowid)
@@ -610,6 +733,16 @@ class Database:
     def update_event_content(self, event_id: int, content: Dict[str, Any]) -> None:
         with self.transaction() as conn:
             conn.execute("UPDATE events SET content_json = ? WHERE id = ?", (json_dumps(content), event_id))
+
+    def get_event(self, event_id: int) -> Optional[Dict[str, Any]]:
+        """Return one event for service-generated follow-up decisions."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM events WHERE id = ?",
+                (int(event_id),),
+            ).fetchone()
+        return self._event_row(row) if row else None
 
     def pending_events(self, group_id: str, limit: int = 500) -> List[Dict[str, Any]]:
         with self._lock:
@@ -2288,6 +2421,23 @@ class Database:
                 (status, json_dumps(result), utc_now(), operation_key),
             )
 
+    def release_retryable_tool_operation(self, operation_key: str) -> bool:
+        """Remove a failed pre-action reservation for one safe correction.
+
+        Most reservations are intentionally permanent: a timeout or
+        connection loss can have changed QQ and must never be replayed.  The
+        Flow API is the one external operation that explicitly marks a 4xx
+        validation response as ``retry_safe``; no video task was accepted, so
+        its reservation may be replaced by the model's corrected arguments.
+        """
+
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "DELETE FROM tool_operations WHERE operation_key = ? AND status = 'failed'",
+                (str(operation_key),),
+            )
+            return bool(cursor.rowcount)
+
     def add_sent_message(self, message_id: str, group_id: str, turn_id: int, content: str) -> None:
         with self.transaction() as conn:
             conn.execute(
@@ -2305,3 +2455,179 @@ class Database:
     def mark_sent_message_recalled(self, message_id: str) -> None:
         with self.transaction() as conn:
             conn.execute("UPDATE sent_messages SET recalled = 1 WHERE message_id = ?", (str(message_id),))
+
+    # Asynchronous Google Flow video jobs
+    @staticmethod
+    def _flow_video_row(row: sqlite3.Row) -> Dict[str, Any]:
+        value = dict(row)
+        value["output_paths"] = json_loads(value.pop("output_paths_json", "[]"), [])
+        value["delivery_message_ids"] = json_loads(
+            value.pop("delivery_message_ids_json", "[]"), []
+        )
+        if not isinstance(value["output_paths"], list):
+            value["output_paths"] = []
+        if not isinstance(value["delivery_message_ids"], list):
+            value["delivery_message_ids"] = []
+        return value
+
+    def create_flow_video_job(
+        self,
+        conversation_id: str,
+        job_id: str,
+        *,
+        prompt: str = "",
+        model: str = "",
+        seconds: int = 8,
+        size: str = "1280x720",
+        outputs: int = 1,
+        retry_count: int = 0,
+        retry_of_job_id: str = "",
+        status: str = "queued",
+        progress: int = 0,
+        created_at: str = "",
+        started_at: str = "",
+        completed_at: str = "",
+        project_url: str = "",
+        output_paths: Optional[Sequence[Any]] = None,
+        error: str = "",
+    ) -> Dict[str, Any]:
+        """Persist an accepted Flow job before the model turn can finish."""
+
+        now = utc_now()
+        created = str(created_at or now)
+        paths = list(output_paths or [])
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO flow_video_jobs("
+                "conversation_id, job_id, prompt, model, seconds, size, outputs, retry_count, retry_of_job_id, status, progress, "
+                "created_at, started_at, completed_at, project_url, output_paths_json, error, "
+                "delivery_status, delivery_message_ids_json, last_poll_at, poll_failures, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '[]', '', 0, ?)",
+                (
+                    str(conversation_id),
+                    str(job_id),
+                    str(prompt or "")[:4_000],
+                    str(model or "")[:200],
+                    max(1, int(seconds)),
+                    str(size or "1280x720")[:40],
+                    max(1, int(outputs)),
+                    max(0, int(retry_count or 0)),
+                    str(retry_of_job_id or "")[:200],
+                    str(status or "queued")[:40],
+                    max(0, min(100, int(progress))),
+                    created,
+                    str(started_at or ""),
+                    str(completed_at or ""),
+                    str(project_url or "")[:2_000],
+                    json_dumps(paths),
+                    str(error or "")[:4_000],
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM flow_video_jobs WHERE conversation_id = ? AND job_id = ?",
+                (str(conversation_id), str(job_id)),
+            ).fetchone()
+        return self._flow_video_row(row) if row else {}
+
+    def get_flow_video_job(self, conversation_id: str, job_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM flow_video_jobs WHERE conversation_id = ? AND job_id = ?",
+                (str(conversation_id), str(job_id)),
+            ).fetchone()
+        return self._flow_video_row(row) if row else None
+
+    def list_flow_video_jobs(
+        self,
+        conversation_id: str,
+        *,
+        status: str = "",
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 100))
+        clauses = ["conversation_id = ?"]
+        params: List[Any] = [str(conversation_id)]
+        if str(status or "").strip():
+            clauses.append("status = ?")
+            params.append(str(status).strip())
+        params.append(safe_limit)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM flow_video_jobs WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at DESC, id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._flow_video_row(row) for row in rows]
+
+    def pending_flow_video_jobs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1_000))
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM flow_video_jobs WHERE delivery_status = 'pending' "
+                "AND status NOT IN ('failed', 'cancelled') "
+                "ORDER BY updated_at ASC, id ASC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        return [self._flow_video_row(row) for row in rows]
+
+    def recover_flow_video_sending_states(self) -> int:
+        """Mark interrupted deliveries as unknown instead of replaying QQ sends."""
+
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE flow_video_jobs SET delivery_status = 'unknown', "
+                "error = CASE WHEN error <> '' THEN error ELSE ? END, updated_at = ? "
+                "WHERE delivery_status = 'sending'",
+                (
+                    "服务重启时视频发送处于未知状态；为避免重复发送，未自动重放。",
+                    utc_now(),
+                ),
+            )
+            return int(cursor.rowcount or 0)
+
+    def update_flow_video_job(self, conversation_id: str, job_id: str, **changes: Any) -> Optional[Dict[str, Any]]:
+        """Update only known Flow fields and return the new row."""
+
+        allowed = {
+            "prompt", "model", "seconds", "size", "outputs", "retry_count", "retry_of_job_id", "status", "progress",
+            "started_at", "completed_at", "project_url", "output_paths", "error",
+            "delivery_status", "delivery_message_ids", "last_poll_at", "poll_failures",
+        }
+        unknown = set(changes).difference(allowed)
+        if unknown:
+            raise ValueError("未知 Flow 视频任务字段：" + ", ".join(sorted(unknown)))
+        if not changes:
+            return self.get_flow_video_job(conversation_id, job_id)
+        assignments: List[str] = []
+        values: List[Any] = []
+        for key, value in changes.items():
+            column = key + "_json" if key in {"output_paths", "delivery_message_ids"} else key
+            if key in {"output_paths", "delivery_message_ids"}:
+                value = json_dumps(value if isinstance(value, list) else [])
+            elif key == "error":
+                value = str(value or "")[:4_000]
+            elif key == "progress":
+                value = max(0, min(100, int(value or 0)))
+            elif key in {"seconds", "outputs", "retry_count", "poll_failures"}:
+                value = int(value or 0)
+            elif key == "retry_of_job_id":
+                value = str(value or "")[:200]
+            assignments.append(column + " = ?")
+            values.append(value)
+        assignments.append("updated_at = ?")
+        values.append(utc_now())
+        values.extend([str(conversation_id), str(job_id)])
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE flow_video_jobs SET "
+                + ", ".join(assignments)
+                + " WHERE conversation_id = ? AND job_id = ?",
+                values,
+            )
+            row = conn.execute(
+                "SELECT * FROM flow_video_jobs WHERE conversation_id = ? AND job_id = ?",
+                (str(conversation_id), str(job_id)),
+            ).fetchone()
+        return self._flow_video_row(row) if row else None

@@ -72,12 +72,11 @@ def test_history_limit_and_live_deduplication(tmp_path: Path) -> None:
     history = [message("100", str(index), "x", index) for index in range(201)]
     assert len(service._limit_history(history, "100")) == MAX_HISTORY_EVENTS
 
-    # The newest chronological message wins when text capacity is the smaller
-    # cap.  The initial event may itself be longer than the cap, but no second
-    # event is allowed to push the batch across it.
+    # The newest chronological messages fill the expanded 150K bootstrap
+    # budget; an older message is retained when both fit inside that window.
     long_history = [message("100", "old", "a" * 30_000, 1), message("100", "new", "b" * 30_000, 2)]
     selected = service._limit_history(long_history, "100")
-    assert [item["message_id"] for item in selected] == ["new"]
+    assert [item["message_id"] for item in selected] == ["old", "new"]
     assert len(normalise_onebot_event(selected[0], history=True)["normalized_text"]) <= MAX_EVENT_TEXT_CHARS
 
     historical = normalise_onebot_event(message("100", "same", "hello"), history=True)
@@ -85,6 +84,20 @@ def test_history_limit_and_live_deduplication(tmp_path: Path) -> None:
     assert service.db.insert_event(historical) is not None
     assert service.db.insert_event(live) is None
     service.db.close()
+
+
+def test_reused_onebot_message_id_is_not_dropped(tmp_path: Path) -> None:
+    """QQ clients may reuse negative IDs after a reconnect or restart."""
+
+    service = AgentService(tmp_path, secret_store=MemorySecrets())
+    try:
+        old = normalise_onebot_event(message("100", "-42", "旧消息", time=100))
+        new = normalise_onebot_event(message("100", "-42", "重新上线后的新消息", time=200))
+        assert service.db.insert_event(old) is not None
+        assert service.db.insert_event(new) is not None
+        assert len(service.db.list_recent_events(limit=10)) == 2
+    finally:
+        service.db.close()
 
 
 @pytest.mark.asyncio
@@ -102,7 +115,7 @@ async def test_enabled_group_initializes_and_disabled_group_is_not_collected(tmp
     service.adapter = FakeAdapter([message("100", "1", "历史消息")])  # type: ignore[assignment]
 
     await service.enable_group("100", "", "inherit")
-    # Bootstrap history now stays verbatim in the newest 50K context window;
+    # Bootstrap history now stays verbatim in the newest 150K context window;
     # it is intentionally not immediately compressed into a summary.
     await asyncio.sleep(0.02)
     assert service.db.get_summary("100") == ""

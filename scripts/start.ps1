@@ -5,7 +5,14 @@ param(
     [switch]$Reload,
     [string]$NapCatExecutable,
     [string]$DataDir,
-    [switch]$KeepOpenOnError
+    [ValidateRange(1, 65535)]
+    [int]$FlowApiPort = 8787,
+    [string]$FlowProjectDir,
+    [string]$FlowCookiesFile,
+    [string]$FlowCookiesFile2,
+    [switch]$NoFlowApi,
+    [switch]$KeepOpenOnError,
+    [switch]$Console
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,9 +32,102 @@ function Get-ProcessSummary {
     return "PID $ProcessId"
 }
 
+function Ensure-FlowApiGuard {
+    if ($NoFlowApi) {
+        return
+    }
+
+    $guardScript = Join-Path $PSScriptRoot 'flow-api-guard.ps1'
+    if (-not (Test-Path -LiteralPath $guardScript -PathType Leaf)) {
+        Write-Host "警告：未找到 Flow API 守护脚本：$guardScript" -ForegroundColor Yellow
+        return
+    }
+
+    $powershell = Get-Command powershell.exe -ErrorAction SilentlyContinue
+    if (-not $powershell) {
+        $powershell = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+    }
+    if (-not $powershell) {
+        Write-Host '警告：未找到 powershell.exe/pwsh.exe，无法自动启动 Google Flow API 守护。' -ForegroundColor Yellow
+        return
+    }
+
+    $arguments = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $guardScript,
+        '-Port', "$FlowApiPort"
+    )
+    if ($FlowProjectDir) {
+        $arguments += '-FlowProjectDir'
+        $arguments += $FlowProjectDir
+    }
+    if ($FlowCookiesFile) {
+        $arguments += '-FlowCookiesFile'
+        $arguments += $FlowCookiesFile
+    }
+    if ($FlowCookiesFile2) {
+        $arguments += '-FlowCookiesFile2'
+        $arguments += $FlowCookiesFile2
+    }
+    if ($DataDir) {
+        $arguments += '-DataDir'
+        $arguments += $DataDir
+    }
+
+    try {
+        # The helper only performs a quick health check/start and then returns;
+        # the hidden -Guard child owns the long-running watchdog loop.
+        & $powershell.Source @arguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "Flow API 守护启动脚本退出代码：$LASTEXITCODE"
+        }
+    } catch {
+        Write-Host "警告：自动启动 Google Flow API 守护失败：$($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 try {
     $projectRoot = Split-Path -Parent $PSScriptRoot
     Set-Location -LiteralPath $projectRoot
+
+    if ($Console) {
+        $consoleScript = Join-Path $PSScriptRoot 'console.ps1'
+        if (-not (Test-Path -LiteralPath $consoleScript -PathType Leaf)) {
+            throw "找不到终端控制台脚本：$consoleScript"
+        }
+        # Use a hashtable splat here. PowerShell treats an array splat as one
+        # positional argument when invoking another script in Windows PowerShell
+        # 5, which makes the nested script try to parse "-Port" as the value
+        # of its integer parameter.
+        $consoleArguments = @{
+            Port = $Port
+            FlowApiPort = $FlowApiPort
+        }
+        if ($Reload) {
+            $consoleArguments.Reload = $true
+        }
+        if ($NapCatExecutable) {
+            $consoleArguments.NapCatExecutable = $NapCatExecutable
+        }
+        if ($DataDir) {
+            $consoleArguments.DataDir = $DataDir
+        }
+        if ($FlowProjectDir) {
+            $consoleArguments.FlowProjectDir = $FlowProjectDir
+        }
+        if ($FlowCookiesFile) {
+            $consoleArguments.FlowCookiesFile = $FlowCookiesFile
+        }
+        if ($FlowCookiesFile2) {
+            $consoleArguments.FlowCookiesFile2 = $FlowCookiesFile2
+        }
+        if ($NoFlowApi) {
+            $consoleArguments.NoFlowApi = $true
+        }
+        & $consoleScript @consoleArguments
+        exit $LASTEXITCODE
+    }
 
     if (-not $DataDir) {
         if (-not $env:LOCALAPPDATA) {
@@ -43,6 +143,12 @@ try {
         New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
     }
     $env:QQ_AI_DATA_DIR = (Resolve-Path -LiteralPath $DataDir -ErrorAction Stop).Path
+
+    # Keep the local video endpoint alive independently from Uvicorn.  This is
+    # intentionally best-effort: a missing Flow companion project must not
+    # prevent the QQ service from starting, and the guard will keep retrying in
+    # the background after the project/Node runtime is installed.
+    Ensure-FlowApiGuard
 
     # Do this before invoking Uvicorn.  Otherwise a second launch prints a
     # low-level WinSock 10048 error and the generic catch below can misleadingly
