@@ -266,6 +266,28 @@ class Database:
                     ON flow_video_jobs(delivery_status, status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_flow_video_jobs_conversation
                     ON flow_video_jobs(conversation_id, created_at DESC, id DESC);
+                -- A non-H.264 source must be explicitly approved in the
+                -- originating conversation before yt-dlp is allowed to
+                -- download it.  Keep this durable so a restart cannot turn
+                -- an old confirmation into an implicit approval.
+                CREATE TABLE IF NOT EXISTS video_download_confirmations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    confirmation_id TEXT NOT NULL UNIQUE,
+                    conversation_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    arguments_json TEXT NOT NULL DEFAULT '{}',
+                    target TEXT NOT NULL DEFAULT '',
+                    source_metadata_json TEXT NOT NULL DEFAULT '{}',
+                    prompt_message_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    actor_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    resolved_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_video_download_confirmations_active
+                    ON video_download_confirmations(conversation_id, status, expires_at);
                 -- There is deliberately no group/conversation identifier:
                 -- this is the one local operator-to-agent conversation shown
                 -- in the loopback dashboard.  It never mixes with QQ data.
@@ -405,6 +427,10 @@ class Database:
                 conn.execute(
                     "ALTER TABLE flow_video_jobs ADD COLUMN retry_of_job_id TEXT NOT NULL DEFAULT ''"
                 )
+            if "browser_state_json" not in flow_columns:
+                conn.execute(
+                    "ALTER TABLE flow_video_jobs ADD COLUMN browser_state_json TEXT NOT NULL DEFAULT '{}'"
+                )
             # This must happen after the legacy-column migration: SQLite runs
             # CREATE INDEX immediately, and an old installation otherwise
             # fails before it reaches the safe ALTER TABLE above.
@@ -476,6 +502,205 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 (key, json_dumps(value), now),
             )
+
+    # Video download confirmations
+    def create_video_download_confirmation(
+        self,
+        confirmation_id: str,
+        conversation_id: str,
+        provider: str,
+        arguments: Dict[str, Any],
+        target: str,
+        source_metadata: Dict[str, Any],
+        prompt_message_id: str,
+        expires_at: str,
+    ) -> Dict[str, Any]:
+        """Create one pending non-H.264 download approval.
+
+        Only one live approval is kept per conversation.  Replacing an old
+        row is explicit and auditable: it becomes ``superseded`` instead of
+        disappearing, so a stale model turn cannot silently revive it.
+        """
+
+        now = utc_now()
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE video_download_confirmations SET status = 'superseded', updated_at = ? "
+                "WHERE conversation_id = ? AND status = 'pending'",
+                (now, str(conversation_id)),
+            )
+            conn.execute(
+                "INSERT INTO video_download_confirmations("
+                "confirmation_id, conversation_id, provider, arguments_json, target, "
+                "source_metadata_json, prompt_message_id, status, actor_id, created_at, "
+                "expires_at, resolved_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', ?, ?, '', ?)",
+                (
+                    str(confirmation_id),
+                    str(conversation_id),
+                    str(provider),
+                    json_dumps(arguments),
+                    str(target),
+                    json_dumps(source_metadata),
+                    str(prompt_message_id),
+                    now,
+                    str(expires_at),
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM video_download_confirmations WHERE confirmation_id = ?",
+                (str(confirmation_id),),
+            ).fetchone()
+        return self._video_download_confirmation_row(row)
+
+    @staticmethod
+    def _video_download_confirmation_row(row: Optional[sqlite3.Row]) -> Dict[str, Any]:
+        if row is None:
+            return {}
+        item = dict(row)
+        item["arguments"] = json_loads(item.pop("arguments_json", ""), {})
+        item["source_metadata"] = json_loads(item.pop("source_metadata_json", ""), {})
+        return item
+
+    def _expire_video_download_confirmations_locked(
+        self,
+        conn: sqlite3.Connection,
+        conversation_id: str,
+    ) -> None:
+        now = utc_now()
+        conn.execute(
+            "UPDATE video_download_confirmations SET status = 'expired', resolved_at = ?, updated_at = ? "
+            "WHERE conversation_id = ? AND status IN ('pending', 'approved') AND expires_at <= ?",
+            (now, now, str(conversation_id), now),
+        )
+
+    def get_active_video_download_confirmation(
+        self,
+        conversation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.transaction() as conn:
+            self._expire_video_download_confirmations_locked(conn, str(conversation_id))
+            row = conn.execute(
+                "SELECT * FROM video_download_confirmations "
+                "WHERE conversation_id = ? AND status IN ('pending', 'approved') "
+                "ORDER BY id DESC LIMIT 1",
+                (str(conversation_id),),
+            ).fetchone()
+        item = self._video_download_confirmation_row(row)
+        return item or None
+
+    def get_video_download_confirmation(
+        self,
+        conversation_id: str,
+        confirmation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.transaction() as conn:
+            self._expire_video_download_confirmations_locked(conn, str(conversation_id))
+            row = conn.execute(
+                "SELECT * FROM video_download_confirmations "
+                "WHERE conversation_id = ? AND confirmation_id = ? LIMIT 1",
+                (str(conversation_id), str(confirmation_id)),
+            ).fetchone()
+        item = self._video_download_confirmation_row(row)
+        return item or None
+
+    def resolve_video_download_confirmation(
+        self,
+        conversation_id: str,
+        confirmation_id: str,
+        decision: str,
+        actor_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        normalized = str(decision or "").strip().lower()
+        if normalized not in {"approve", "decline"}:
+            raise ValueError("视频下载确认 decision 必须是 approve 或 decline")
+        target_status = "approved" if normalized == "approve" else "declined"
+        now = utc_now()
+        with self.transaction() as conn:
+            self._expire_video_download_confirmations_locked(conn, str(conversation_id))
+            conn.execute(
+                "UPDATE video_download_confirmations SET status = ?, actor_id = ?, "
+                "resolved_at = ?, updated_at = ? WHERE conversation_id = ? "
+                "AND confirmation_id = ? AND status = 'pending'",
+                (
+                    target_status,
+                    str(actor_id),
+                    now,
+                    now,
+                    str(conversation_id),
+                    str(confirmation_id),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM video_download_confirmations "
+                "WHERE conversation_id = ? AND confirmation_id = ? LIMIT 1",
+                (str(conversation_id), str(confirmation_id)),
+            ).fetchone()
+        item = self._video_download_confirmation_row(row)
+        return item or None
+
+    def claim_video_download_confirmation(
+        self,
+        conversation_id: str,
+        confirmation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically consume an approved confirmation for one download."""
+
+        now = utc_now()
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE video_download_confirmations SET status = 'running', updated_at = ? "
+                "WHERE conversation_id = ? AND confirmation_id = ? AND status = 'approved' "
+                "AND expires_at > ?",
+                (now, str(conversation_id), str(confirmation_id), now),
+            )
+            if not cursor.rowcount:
+                return None
+            row = conn.execute(
+                "SELECT * FROM video_download_confirmations "
+                "WHERE conversation_id = ? AND confirmation_id = ? LIMIT 1",
+                (str(conversation_id), str(confirmation_id)),
+            ).fetchone()
+        item = self._video_download_confirmation_row(row)
+        return item or None
+
+    def finish_video_download_confirmation(
+        self,
+        conversation_id: str,
+        confirmation_id: str,
+        status: str,
+    ) -> None:
+        normalized = str(status or "").strip().lower()
+        if normalized not in {"completed", "failed", "declined"}:
+            raise ValueError("视频下载确认完成状态无效")
+        now = utc_now()
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE video_download_confirmations SET status = ?, resolved_at = ?, updated_at = ? "
+                "WHERE conversation_id = ? AND confirmation_id = ? AND status IN ('running', 'approved')",
+                (normalized, now, now, str(conversation_id), str(confirmation_id)),
+            )
+
+    def recover_video_download_confirmations(self) -> int:
+        """Fail confirmation work that was interrupted by a service restart.
+
+        A confirmation is deliberately never resumed automatically: doing so
+        could start a second yt-dlp download after the first process had
+        already spawned it.  Marking both the claimed ``running`` state and
+        the pre-claim ``approved`` state terminal lets the next user request
+        create a fresh confirmation without leaving a permanently busy row.
+        """
+
+        now = utc_now()
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE video_download_confirmations "
+                "SET status = 'failed', resolved_at = COALESCE(resolved_at, ?), updated_at = ? "
+                "WHERE status IN ('running', 'approved')",
+                (now, now),
+            )
+            return int(cursor.rowcount or 0)
 
     # Local administrator conversation
     def append_admin_message(
@@ -2461,6 +2686,7 @@ class Database:
     def _flow_video_row(row: sqlite3.Row) -> Dict[str, Any]:
         value = dict(row)
         value["output_paths"] = json_loads(value.pop("output_paths_json", "[]"), [])
+        value["browser_state"] = json_loads(value.pop("browser_state_json", "{}"), {})
         value["delivery_message_ids"] = json_loads(
             value.pop("delivery_message_ids_json", "[]"), []
         )
@@ -2593,7 +2819,7 @@ class Database:
         allowed = {
             "prompt", "model", "seconds", "size", "outputs", "retry_count", "retry_of_job_id", "status", "progress",
             "started_at", "completed_at", "project_url", "output_paths", "error",
-            "delivery_status", "delivery_message_ids", "last_poll_at", "poll_failures",
+            "delivery_status", "delivery_message_ids", "last_poll_at", "poll_failures", "browser_state",
         }
         unknown = set(changes).difference(allowed)
         if unknown:
@@ -2603,9 +2829,11 @@ class Database:
         assignments: List[str] = []
         values: List[Any] = []
         for key, value in changes.items():
-            column = key + "_json" if key in {"output_paths", "delivery_message_ids"} else key
+            column = key + "_json" if key in {"output_paths", "delivery_message_ids", "browser_state"} else key
             if key in {"output_paths", "delivery_message_ids"}:
                 value = json_dumps(value if isinstance(value, list) else [])
+            elif key == "browser_state":
+                value = json_dumps(value if isinstance(value, dict) else {})
             elif key == "error":
                 value = str(value or "")[:4_000]
             elif key == "progress":

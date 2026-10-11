@@ -8,8 +8,6 @@ param(
     [ValidateRange(1, 65535)]
     [int]$FlowApiPort = 8787,
     [string]$FlowProjectDir,
-    [string]$FlowCookiesFile,
-    [string]$FlowCookiesFile2,
     [switch]$NoFlowApi,
     [switch]$NoStart,
     [ValidateRange(5, 600)]
@@ -121,14 +119,6 @@ try {
         if ($FlowProjectDir) {
             $argumentParts += '-FlowProjectDir'
             $argumentParts += (Quote-ProcessArgument $FlowProjectDir)
-        }
-        if ($FlowCookiesFile) {
-            $argumentParts += '-FlowCookiesFile'
-            $argumentParts += (Quote-ProcessArgument $FlowCookiesFile)
-        }
-        if ($FlowCookiesFile2) {
-            $argumentParts += '-FlowCookiesFile2'
-            $argumentParts += (Quote-ProcessArgument $FlowCookiesFile2)
         }
         if ($NoFlowApi) {
             $argumentParts += '-NoFlowApi'

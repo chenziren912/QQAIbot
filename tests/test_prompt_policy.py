@@ -130,7 +130,7 @@ async def test_chat_normal_turn_keeps_internal_summary_and_allows_bounded_proact
     assert "可以保持沉默" in developer
     assert "服务生成的实时直接提及规则" not in developer
     assert "你可自主决定是否调用工具" in user_text
-    send_tool = request["tools"][0]["function"]
+    send_tool = next(t["function"] for t in request["tools"] if t["function"]["name"] == "send_group_message")
     assert "单次决策可多次调用" in send_tool["description"]
     assert "服务生成的可信消息元数据" in send_tool["parameters"]["properties"]["reply_to_message_id"]["description"]
 
@@ -226,7 +226,7 @@ async def test_responses_normal_turn_has_the_same_internal_summary_and_tool_boun
     assert developer.find("旧全局提示词") < developer.find("不可变群聊发言策略")
     assert "同一话题的重复回复" in developer
     assert "你可自主决定是否调用工具" in user_text
-    send_tool = request["tools"][0]
+    send_tool = next(t for t in request["tools"] if t["name"] == "send_group_message")
     assert "单次决策可多次调用" in send_tool["description"]
     assert "服务生成的可信消息元数据" in send_tool["parameters"]["properties"]["reply_to_message_id"]["description"]
 

@@ -19,11 +19,15 @@ class FakeFlowClient:
         self.created: list[dict[str, Any]] = []
         self.polls = 0
 
+    async def health(self) -> dict[str, Any]:
+        return {"ok": True, "runtime": "qqbot-ai-browser", "submission_confirmation": "flow_page_dom", "ai_browser_control": True}
+
     async def create(self, **kwargs: Any) -> dict[str, Any]:
         self.created.append(kwargs)
         return {
             "id": "video_flow_1",
             "status": "queued",
+            "submission_confirmed": True,
             "progress": 0,
             "model": kwargs["model"],
             "seconds": str(kwargs["seconds"]),
@@ -97,6 +101,7 @@ async def test_flow_video_create_list_and_result_are_async_and_scoped(tmp_path: 
         # ``n`` is the public tool field; the client adapter must receive its
         # Python keyword as ``outputs`` so the request reaches the Flow API.
         assert client.created[0]["outputs"] == 1
+        assert client.created[0]["workspace_dir"] == str(service.conversation_workspace("123"))
 
         list_turn = service.db.create_turn("123", [])
         listed = await service._execute_tool(

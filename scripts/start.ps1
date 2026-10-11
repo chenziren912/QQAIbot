@@ -8,8 +8,6 @@ param(
     [ValidateRange(1, 65535)]
     [int]$FlowApiPort = 8787,
     [string]$FlowProjectDir,
-    [string]$FlowCookiesFile,
-    [string]$FlowCookiesFile2,
     [switch]$NoFlowApi,
     [switch]$KeepOpenOnError,
     [switch]$Console
@@ -62,14 +60,6 @@ function Ensure-FlowApiGuard {
         $arguments += '-FlowProjectDir'
         $arguments += $FlowProjectDir
     }
-    if ($FlowCookiesFile) {
-        $arguments += '-FlowCookiesFile'
-        $arguments += $FlowCookiesFile
-    }
-    if ($FlowCookiesFile2) {
-        $arguments += '-FlowCookiesFile2'
-        $arguments += $FlowCookiesFile2
-    }
     if ($DataDir) {
         $arguments += '-DataDir'
         $arguments += $DataDir
@@ -115,12 +105,6 @@ try {
         }
         if ($FlowProjectDir) {
             $consoleArguments.FlowProjectDir = $FlowProjectDir
-        }
-        if ($FlowCookiesFile) {
-            $consoleArguments.FlowCookiesFile = $FlowCookiesFile
-        }
-        if ($FlowCookiesFile2) {
-            $consoleArguments.FlowCookiesFile2 = $FlowCookiesFile2
         }
         if ($NoFlowApi) {
             $consoleArguments.NoFlowApi = $true

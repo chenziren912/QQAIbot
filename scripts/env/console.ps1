@@ -8,8 +8,6 @@ param(
     [ValidateRange(1, 65535)]
     [int]$FlowApiPort = 8787,
     [string]$FlowProjectDir,
-    [string]$FlowCookiesFile,
-    [string]$FlowCookiesFile2,
     [switch]$NoFlowApi,
     [switch]$NoStart,
     [ValidateRange(5, 600)]

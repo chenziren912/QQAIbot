@@ -49,6 +49,7 @@ COMMAND_HELP: Mapping[str, str] = {
     "/status": "显示服务、OneBot、积压事件、Flow 任务和媒体占用状态。",
     "/config": "显示当前非敏感配置（不会显示 API Key、Token 或 Cookie）。",
     "/groups": "列出已发现的群聊和私聊，以及启用状态和积压数量。",
+    "/monitor-all [on|off]": "切换所有已知及新发现的群聊/私聊自动监听；默认开启并保存到本机配置。",
     "/group <会话ID>": "查看一个群聊或私聊的详细状态、摘要和工作目录。",
     "/enable <会话ID>": "启用一个会话；群聊会尝试读取历史，私聊立即开始监听。",
     "/disable <会话ID>": "停止处理一个会话的新消息；已保存的消息不会删除。",
@@ -85,6 +86,10 @@ _ALIASES = {
     "list-groups": "groups",
     "群": "groups",
     "群聊": "groups",
+    "monitor-all": "monitor-all",
+    "monitor_all": "monitor-all",
+    "全量监听": "monitor-all",
+    "自动监听": "monitor-all",
     "enable": "enable",
     "启用": "enable",
     "disable": "disable",
@@ -441,6 +446,22 @@ async def execute_command(service: "AgentService", line: str) -> TerminalResult:
     if name == "sync":
         await service.sync_groups()
         return TerminalResult("已请求同步 OneBot 群列表。当前会话数：" + str(len(service.db.list_groups())))
+    if name == "monitor-all":
+        mode = args[0].strip().lower() if args else "on"
+        if mode in {"on", "开启", "开", "true", "1"}:
+            result = await service.set_auto_monitor_all(True)
+            return TerminalResult(
+                "已开启所有会话自动监听：已知 %s 个，已初始化 %s 个，失败 %s 个；"
+                "该开关已保存，QQBot 重启后仍保持开启。"
+                % (result.get("known", 0), result.get("initialized", 0), result.get("failed", 0))
+            )
+        if mode in {"off", "关闭", "关", "false", "0"}:
+            result = await service.set_auto_monitor_all(False)
+            return TerminalResult(
+                "已关闭全量自动监听：保留各会话自己的启用状态，停止 %s 个全量 worker。"
+                % result.get("cancelled_workers", 0)
+            )
+        raise ValueError("用法：/monitor-all [on|off]")
     if name == "workspace":
         if not args:
             raise ValueError("用法：/workspace <会话ID> [路径]")

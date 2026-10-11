@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet(1, 2)]
+    [ValidateRange(1, 20)]
     [int]$Account = 1,
     [ValidateRange(1, 65535)]
     [int]$Port = 8787,
@@ -58,15 +58,15 @@ try {
         Start-Sleep -Seconds 1
     }
     $result = Invoke-RestMethod -Method Post -Uri $loginUrl -Headers $headers -TimeoutSec 30
-    if ($result.ok -ne $true -or $result.status -ne 'waiting_for_user') {
+    if ($result.opened -ne $true -or $result.persistentProfile -ne $true) {
         throw 'Flow API 未能打开专用登录窗口。'
     }
     [void](Read-Host '完成登录并确认可以进入 Flow 后，请关闭整个专用 Chrome 窗口，再按 Enter 开始严格检测')
     $result = Invoke-RestMethod -Method Post -Uri $verifyUrl -Headers $headers -TimeoutSec 120
-    if ($result.ok -ne $true -or $result.status -ne 'verified') {
+    if ($result.ready -ne $true -or $result.persistentProfile -ne $true) {
         throw 'Flow API 未确认登录可用。'
     }
-    Write-Host "账号 $Account 登录已保存并通过 Flow 工作区检测，后续服务重启不会回退到旧 Cookie。" -ForegroundColor Green
+    Write-Host "账号 $Account 登录已保存在专用持久浏览器并通过 Flow 工作区检测；不读取 Cookie 文件。" -ForegroundColor Green
 } catch {
     $details = $_.ErrorDetails.Message
     if ($details) {

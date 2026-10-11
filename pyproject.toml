@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qq-ai-group-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "A local Windows QQ group/private-chat AI agent powered by NapCat and OpenAI-compatible APIs"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,4 +37,4 @@ testpaths = ["tests"]
 packages = ["app"]
 
 [tool.setuptools.package-data]
-app = ["templates/*.html", "static/*.css"]
+app = ["templates/*.html", "static/*.css", "assistant_introduction.md"]

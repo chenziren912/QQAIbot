@@ -70,7 +70,7 @@ class FlowVideoClient:
         api_key: str = "",
         *,
         timeout: float = 45.0,
-        create_timeout: float = 180.0,
+        create_timeout: float = 20 * 60,
     ) -> None:
         value = str(base_url or "").strip().rstrip("/")
         if not value:
@@ -80,11 +80,10 @@ class FlowVideoClient:
         self.base_url = value[:-3] if value.lower().endswith("/v1") else value
         self.api_key = str(api_key or "").strip()
         self.timeout = max(2.0, min(300.0, float(timeout)))
-        # POST /v1/videos only waits for local input validation and background
-        # task admission.  Keep a larger ceiling for an older companion API
-        # that may still perform a strict Flow readiness check before it
-        # returns; status polling and downloads retain the shorter timeout.
-        self.create_timeout = max(2.0, min(300.0, float(create_timeout)))
+        # POST /v1/videos returns after Flow's page confirms that the Generate
+        # action created a task. The render remains asynchronous; this ceiling
+        # also allows the browser worker to wait in its account queue.
+        self.create_timeout = max(2.0, min(20 * 60, float(create_timeout)))
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -102,7 +101,11 @@ class FlowVideoClient:
         request_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         url = self.base_url + path
-        timeout = self.timeout if request_timeout is None else max(2.0, min(300.0, float(request_timeout)))
+        # Creation waits for the Flow browser worker to confirm that the page
+        # actually accepted the task. Keep this ceiling aligned with the
+        # configured 20-minute queue/start window; ordinary status/download
+        # requests still use the shorter client timeout.
+        timeout = self.timeout if request_timeout is None else max(2.0, min(20 * 60, float(request_timeout)))
         try:
             async with httpx.AsyncClient(
                 timeout=timeout,
@@ -149,6 +152,7 @@ class FlowVideoClient:
         outputs: int = 1,
         input_reference: str = "",
         max_credits: Optional[int] = None,
+        workspace_dir: str = "",
     ) -> Dict[str, Any]:
         requested_model = str(model or FLOW_VIDEO_MODEL).strip()
         # Keep the HTTP adapter defensive even when it is called outside the
@@ -181,6 +185,9 @@ class FlowVideoClient:
             body["input_reference"] = str(input_reference)
         if max_credits is not None:
             body["max_credits"] = int(max_credits)
+        if workspace_dir:
+            # Internal service-owned destination, never a model-supplied path.
+            body["workspace_dir"] = str(workspace_dir)
         return await self._request_json(
             "POST",
             "/v1/videos",

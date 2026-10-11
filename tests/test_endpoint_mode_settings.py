@@ -18,6 +18,13 @@ def test_endpoint_mode_defaults_to_completions_and_rejects_invalid_saved_values(
     assert AppSettings.from_mapping({"llm": {"endpoint_mode": "invalid"}}).llm.endpoint_mode == "completions"
 
 
+def test_global_conversation_monitoring_defaults_on_and_round_trips() -> None:
+    settings = AppSettings.from_mapping({})
+    assert settings.auto_monitor_all_conversations is True
+    restored = AppSettings.from_mapping(settings.as_mapping())
+    assert restored.auto_monitor_all_conversations is True
+
+
 def test_settings_form_persists_the_selected_endpoint_mode(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(config, "keyring", None)
     app = create_app(tmp_path)

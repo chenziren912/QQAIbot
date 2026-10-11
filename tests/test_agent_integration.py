@@ -111,6 +111,7 @@ async def test_enabled_group_initializes_and_disabled_group_is_not_collected(tmp
 
     monkeypatch.setattr("app.service.ChatCompletionsClient", SummaryClient)
     service = AgentService(tmp_path, secret_store=MemorySecrets())
+    service._auto_monitor_all_conversations = False
     service.db.upsert_group("100", "测试群")
     service.adapter = FakeAdapter([message("100", "1", "历史消息")])  # type: ignore[assignment]
 

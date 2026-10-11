@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,32 @@ class SuccessfulProcess:
 
     async def communicate(self):
         return (str(self.path).encode("utf-8"), b"")
+
+
+class ProbeProcess:
+    returncode = 0
+
+    async def communicate(self):
+        return (
+            json.dumps(
+                {
+                    "title": "test",
+                    "webpage_url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+                    "formats": [
+                        {
+                            "format_id": "18",
+                            "vcodec": "avc1.42001E",
+                            "acodec": "mp4a.40.2",
+                            "height": 360,
+                            "width": 640,
+                            "ext": "mp4",
+                            "tbr": 500,
+                        }
+                    ],
+                }
+            ).encode("utf-8"),
+            b"",
+        )
 
 
 @pytest.mark.asyncio
@@ -202,10 +229,23 @@ async def test_video_download_can_finish_without_onebot_and_never_sends_file(
     video.write_bytes(b"mp4")
 
     async def fake_create(*_: object, **__: object) -> SuccessfulProcess:
+        command = list(_)
+        if "--dump-single-json" in command:
+            return ProbeProcess()
         return SuccessfulProcess(video)
 
     monkeypatch.setattr("app.service.asyncio.create_subprocess_exec", fake_create)
     monkeypatch.setattr("app.service._windows_configured_https_proxy", lambda: "")
+    async def fake_media_probe(path: Path) -> dict:
+        return {
+            "_probe_ok": True,
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264", "codec_tag_string": "avc1", "profile": "Main", "level": 31, "width": 640, "height": 360, "pix_fmt": "yuv420p"},
+                {"codec_type": "audio", "codec_name": "aac", "channels": 2},
+            ],
+            "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+        }
+    monkeypatch.setattr(service, "_probe_media_file", fake_media_probe)
     try:
         turn_id = service.db.create_turn("private:1", [])
         result = await service._execute_tool(

@@ -86,6 +86,28 @@ def test_group_toggle_uses_valid_csrf_and_keeps_unknown_groups_out(tmp_path, mon
         assert unknown.status_code == 404
 
 
+def test_global_monitoring_button_is_on_by_default_and_persists_toggle(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(config, "keyring", None)
+    app = create_app(tmp_path)
+    with TestClient(app) as client:
+        service = app.state.service
+        assert service._auto_monitor_all_conversations is True
+        assert service.db.get_json_setting("app_settings", {})["auto_monitor_all_conversations"] is True
+        page = client.get("/")
+        assert "关闭全量自动监听" in page.text
+        token = csrf_from(page.text)
+        response = client.post(
+            "/monitoring/toggle",
+            data={"csrf_token": token, "enabled": "false"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert service._auto_monitor_all_conversations is False
+        assert service.settings.auto_monitor_all_conversations is False
+        assert service.db.get_json_setting("app_settings", {})["auto_monitor_all_conversations"] is False
+        assert "开启全量自动监听" in client.get("/").text
+
+
 def test_dashboard_renders_group_and_turn_diagnostics(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(config, "keyring", None)
     app = create_app(tmp_path)

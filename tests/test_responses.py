@@ -96,7 +96,7 @@ async def test_responses_uses_native_input_tools_images_and_reasoning_shape() ->
         "detail": "auto",
     }
     assert request["tools"][0]["type"] == "function"
-    assert request["tools"][0]["name"] == "send_group_message"
+    assert any(t["name"] == "send_group_message" for t in request["tools"])
     assert "function" not in request["tools"][0]
 
 

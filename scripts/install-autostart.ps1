@@ -6,8 +6,6 @@ param(
     [int]$FlowApiPort = 8787,
     [string]$NapCatExecutable,
     [string]$FlowProjectDir,
-    [string]$FlowCookiesFile,
-    [string]$FlowCookiesFile2,
     [switch]$NoFlowApi,
     [switch]$Remove
 )
@@ -60,17 +58,7 @@ if ($FlowProjectDir) {
     $argumentParts += ('"{0}"' -f $resolvedFlowProject.Path)
 }
 
-if ($FlowCookiesFile) {
-    $resolvedFlowCookies = Resolve-Path -LiteralPath $FlowCookiesFile -ErrorAction Stop
-    $argumentParts += '-FlowCookiesFile'
-    $argumentParts += ('"{0}"' -f $resolvedFlowCookies.Path)
-}
 
-if ($FlowCookiesFile2) {
-    $resolvedFlowCookies2 = Resolve-Path -LiteralPath $FlowCookiesFile2 -ErrorAction Stop
-    $argumentParts += '-FlowCookiesFile2'
-    $argumentParts += ('"{0}"' -f $resolvedFlowCookies2.Path)
-}
 
 if ($NoFlowApi) {
     $argumentParts += '-NoFlowApi'
@@ -107,14 +95,6 @@ $flowArgumentParts = @(
 if ($FlowProjectDir) {
     $flowArgumentParts += '-FlowProjectDir'
     $flowArgumentParts += ('"{0}"' -f $resolvedFlowProject.Path)
-}
-if ($FlowCookiesFile) {
-    $flowArgumentParts += '-FlowCookiesFile'
-    $flowArgumentParts += ('"{0}"' -f $resolvedFlowCookies.Path)
-}
-if ($FlowCookiesFile2) {
-    $flowArgumentParts += '-FlowCookiesFile2'
-    $flowArgumentParts += ('"{0}"' -f $resolvedFlowCookies2.Path)
 }
 
 $flowAction = New-ScheduledTaskAction -Execute $powershellExe -Argument ($flowArgumentParts -join ' ')

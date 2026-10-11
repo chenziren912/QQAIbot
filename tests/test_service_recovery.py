@@ -36,6 +36,59 @@ class HistoryAdapter:
         self.connected = False
 
 
+@pytest.mark.asyncio
+async def test_global_monitoring_keeps_durable_flags_unchanged(tmp_path: Path) -> None:
+    service = AgentService(tmp_path, secret_store=FakeSecretStore())
+    service.db.upsert_group("100", "temporary")
+    service.db.set_group_config("100", False)
+    service.db.set_group_initialized("100", False)
+    service.db.upsert_group("200", "already enabled")
+    service.db.set_group_config("200", True)
+    service.db.set_group_initialized("200", True)
+    service.adapter = HistoryAdapter({"100": [_message("100", "old", "history", 1)]})  # type: ignore[assignment]
+    scheduled: list[str] = []
+
+    async def record_schedule(group_id: str) -> None:
+        scheduled.append(group_id)
+
+    service._schedule_worker = record_schedule  # type: ignore[method-assign]
+    result = await service.set_auto_monitor_all(True)
+
+    assert result["enabled"] is True
+    assert result["known"] == 2
+    assert result["initialized"] == 2
+    assert service._auto_monitor_all_conversations is True
+    assert not service.db.get_group("100")["enabled"]
+    assert bool(service.db.get_group("100")["initialized"]) is True
+    assert scheduled == ["100"]
+
+    disabled = await service.set_auto_monitor_all(False)
+    assert disabled["enabled"] is False
+    assert service._auto_monitor_all_conversations is False
+    assert not service.db.get_group("100")["enabled"]
+    await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_global_monitoring_collects_new_disabled_conversation(tmp_path: Path) -> None:
+    service = AgentService(tmp_path, secret_store=FakeSecretStore())
+    service.db.upsert_group("100", "temporary")
+    service.db.set_group_config("100", False)
+    service.db.set_group_initialized("100", True)
+    service._auto_monitor_all_conversations = True
+    scheduled: list[str] = []
+
+    async def record_schedule(group_id: str) -> None:
+        scheduled.append(group_id)
+
+    service._schedule_worker = record_schedule  # type: ignore[method-assign]
+    await service.handle_onebot_event(_message("100", "live", "new live message", 2))
+
+    assert service.db.pending_events("100")[0]["message_id"] == "live"
+    assert scheduled == ["100"]
+    await service.stop()
+
+
 def _message(group_id: str, message_id: str, text: str, timestamp: int) -> dict[str, Any]:
     return {
         "post_type": "message",
@@ -51,6 +104,7 @@ def _message(group_id: str, message_id: str, text: str, timestamp: int) -> dict[
 @pytest.mark.asyncio
 async def test_reconnect_backfill_deduplicates_and_skips_disabled_groups(tmp_path: Path) -> None:
     service = AgentService(tmp_path, secret_store=FakeSecretStore())
+    service._auto_monitor_all_conversations = False
     service.db.upsert_group("100", "enabled")
     service.db.set_group_config("100", True)
     service.db.set_group_initialized("100", True)

@@ -497,6 +497,43 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             service.runtime_warning = "保存配置失败：" + str(exc)
         return RedirectResponse("/", status_code=303)
 
+    @app.post("/monitoring/toggle")
+    async def toggle_global_monitoring(request: Request) -> RedirectResponse:
+        """Toggle the global conversation listener from the local dashboard."""
+
+        form = await require_form_csrf(request)
+        enabled = _checkbox(form.get("enabled"))
+        try:
+            result = await service.set_auto_monitor_all(enabled)
+            if enabled:
+                service.runtime_warning = (
+                    "已开启全量会话监听：当前已知 %s 个会话，已初始化 %s 个。"
+                    % (result.get("known", 0), result.get("initialized", 0))
+                )
+            else:
+                service.runtime_warning = "已关闭全量会话监听；各会话恢复使用自己的启用开关。"
+        except Exception as exc:
+            logger.exception("could not toggle global conversation monitoring")
+            service.runtime_warning = "切换全量会话监听失败：" + str(exc)
+        return RedirectResponse("/#monitoring", status_code=303)
+
+    @app.post("/friend-requests/toggle")
+    async def toggle_friend_request_approval(request: Request) -> RedirectResponse:
+        """Toggle automatic approval of incoming friend requests."""
+
+        form = await require_form_csrf(request)
+        enabled = _checkbox(form.get("enabled"))
+        try:
+            await service.set_auto_accept_friend_requests(enabled)
+            if enabled:
+                service.runtime_warning = "已开启自动通过好友申请；后续收到的好友申请会直接同意。"
+            else:
+                service.runtime_warning = "已关闭自动通过好友申请；新的申请不会被自动处理。"
+        except Exception as exc:
+            logger.exception("could not toggle automatic friend request approval")
+            service.runtime_warning = "切换自动通过好友申请失败：" + str(exc)
+        return RedirectResponse("/#friend-requests", status_code=303)
+
     @app.post("/admin/chat")
     async def admin_chat(request: Request) -> RedirectResponse:
         """Send one local administrator instruction to the configured model.

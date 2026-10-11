@@ -210,6 +210,10 @@ button, a, input, select, textarea, summary { -webkit-tap-highlight-color: trans
 .notice-danger .notice-icon { background: var(--red); color: #fff; }
 
 .status-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }
+.monitoring-panel { margin-bottom: 20px; }
+.monitoring-control { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 18px 26px 22px; color: var(--text-secondary); }
+.monitoring-control p { max-width: 860px; margin: 0; }
+.monitoring-control form { flex: 0 0 auto; }
 .metric-card, .panel { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); }
 .metric-card { display: flex; min-height: 142px; flex-direction: column; padding: 20px; transition: transform .2s ease, box-shadow .2s ease; }
 .metric-card:hover { box-shadow: var(--shadow-hover); transform: translateY(-3px); }
@@ -423,6 +427,7 @@ details[open] > summary::after { transform: rotate(180deg); }
   .group-meta { grid-template-columns: 1fr 1fr; }
   .group-memory > summary, .memory-heading { align-items: flex-start; flex-direction: column; }
   .panel-heading, .group-card, .settings-form { padding-right: 17px; padding-left: 17px; }
+  .monitoring-control { align-items: flex-start; flex-direction: column; padding-right: 17px; padding-left: 17px; }
   .admin-chat-intro, .admin-chat-form, .admin-message, .rules-content, .timeline-item, .turn-card, .audit-row { padding-right: 17px; padding-left: 17px; }
   .footer { align-items: flex-start; flex-direction: column; }
 }

@@ -15,6 +15,33 @@ api-key.json
 *.sqlite3
 *.db
 .env
+.env.*
+!.env.example
+rules.md
+node_modules/
+*.egg-info/
+build/
+dist/
+*.sqlite3-*
+*.sqlite3.*
+*.db-*
+
+# Persistent Chrome profiles and Flow observations must stay local even when
+# their roots are configured inside a checkout instead of the default data/.
+flow-browser-profiles/
+browser-profiles/
+flow-ai-jobs/
+Default/
+Profile [0-9]*/
+Guest Profile/
+System Profile/
+Local State
+Cookies
+Cookies-journal
+Login Data
+Login Data-journal
+Web Data
+Web Data-journal
 
 # Never commit exported browser sessions or credential-bearing cookie files,
 # even if they are accidentally placed outside the runtime data directory.

@@ -255,11 +255,70 @@ def _task_message(text: str) -> dict[str, Any]:
 
 def test_explicit_agent_task_marker_matches_video_request_but_not_normal_chat() -> None:
     task = normalise_onebot_event(_task_message("深度理解这个视频讲述的内容，生成文字稿markdown并渲染图片"))
+    video_discovery = normalise_onebot_event(_task_message("在B站上找几期有关MC的视频"))
+    video_recommendation = normalise_onebot_event(_task_message("推荐几个有关MC的视频"))
     ordinary = normalise_onebot_event(_task_message("这个视频真好看"))
 
     assert task["content"]["live_explicit_agent_task_request"] is True
+    assert video_discovery["content"]["live_explicit_agent_task_request"] is True
+    assert video_recommendation["content"]["live_explicit_agent_task_request"] is True
     assert ordinary["content"]["live_explicit_agent_task_request"] is False
     assert "实时明确任务标记" in AgentService._format_events([task])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint_mode", ["completions", "responses"])
+async def test_explicit_video_search_delivers_final_answer_in_same_turn(endpoint_mode: str) -> None:
+    if endpoint_mode == "responses":
+        script = [
+            _responses_tool("Builtin_Websearch", {"query": "site:bilibili.com MC 视频"}),
+            _responses_text("找到了几期 MC 视频，见链接。"),
+        ]
+    else:
+        script = [
+            _chat_tool("Builtin_Websearch", {"query": "site:bilibili.com MC 视频"}),
+            _chat_text("找到了几期 MC 视频，见链接。"),
+        ]
+    client = ScriptedClient(script, endpoint_mode=endpoint_mode)
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def execute(name: str, arguments: dict[str, Any], *_: Any) -> dict[str, Any]:
+        calls.append((name, arguments))
+        if name == "Builtin_Websearch":
+            return {
+                "ok": True,
+                "results": [
+                    {
+                        "title": "MC 生存实况",
+                        "url": "https://www.bilibili.com/video/BV1234567890/",
+                        "snippet": "Minecraft 生存系列视频",
+                    }
+                ],
+            }
+        assert name == "send_group_message"
+        return {"ok": True, "message_id": "same-turn-answer"}
+
+    result = await client.run_turn(
+        "旧摘要",
+        "在B站上找几期有关MC的视频",
+        "",
+        "off",
+        [],
+        execute,
+        direct_explicit_task_reply_required=True,
+    )
+
+    assert result.summary == "找到了几期 MC 视频，见链接。"
+    assert [name for name, _ in calls] == ["Builtin_Websearch", "send_group_message"]
+    assert calls[-1][1] == {"text": "找到了几期 MC 视频，见链接。"}
+    first_request = client.requests[0]
+    assert first_request["tool_choice"] == "auto"
+    developer_prompt = (
+        first_request["instructions"]
+        if endpoint_mode == "responses"
+        else first_request["messages"][0]["content"]
+    )
+    assert "视频搜索/推荐与下载严格区分" in developer_prompt
 
 
 class _ConnectedAdapter:

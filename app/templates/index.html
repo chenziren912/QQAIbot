@@ -21,6 +21,7 @@
     <nav class="topbar-nav" aria-label="页面导航">
       <a href="#overview">概览</a>
       <a href="#admin-chat">AI 对话</a>
+      <a href="#friend-requests">好友申请</a>
       <a href="#groups-title">群聊</a>
       <a href="#settings-title">设置</a>
       <a href="#audits-title">审计</a>
@@ -93,7 +94,7 @@
       <article class="metric-card">
         <span class="metric-label">已启用群</span>
         <strong class="metric-value">{{ app_state.get('enabled_group_count', 0) }}</strong>
-        <span class="metric-detail">新发现的群默认不会采集</span>
+        <span class="metric-detail">{% if app_state.get('auto_monitor_all_conversations') %}全量会话监听已开启{% else %}按每个会话的开关监听{% endif %}</span>
       </article>
       <article class="metric-card">
         <span class="metric-label">待处理事件</span>
@@ -110,6 +111,58 @@
         <strong class="metric-value">{{ app_state.get('media_usage_label') or '0 B' }}</strong>
         <span class="metric-detail">预算 {{ app_settings.get('media_budget_gib', 20) }} GiB</span>
       </article>
+    </section>
+
+    <section class="panel monitoring-panel" id="monitoring" aria-labelledby="monitoring-title">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">会话监听总开关</p>
+          <h2 id="monitoring-title">自动加入监听</h2>
+        </div>
+        {% if app_state.get('auto_monitor_all_conversations') %}
+          <span class="badge badge-success">默认开启</span>
+        {% else %}
+          <span class="badge">已关闭</span>
+        {% endif %}
+      </div>
+      <div class="monitoring-control">
+        <p>开启后，所有已发现以及之后新出现的群聊、私聊都会自动开始监听；关闭后恢复各会话自己的启用状态。这个按钮会保存到本机配置。</p>
+        <form method="post" action="/monitoring/toggle">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="enabled" value="{% if app_state.get('auto_monitor_all_conversations') %}false{% else %}true{% endif %}">
+          {% if app_state.get('auto_monitor_all_conversations') %}
+            <button class="button button-danger" type="submit">关闭全量自动监听</button>
+          {% else %}
+            <button class="button" type="submit">开启全量自动监听</button>
+          {% endif %}
+        </form>
+      </div>
+    </section>
+
+    <section class="panel monitoring-panel" id="friend-requests" aria-labelledby="friend-requests-title">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">好友关系控制</p>
+          <h2 id="friend-requests-title">自动通过好友申请</h2>
+        </div>
+        {% if app_settings.get('auto_accept_friend_requests') %}
+          <span class="badge badge-success">已开启</span>
+        {% else %}
+          <span class="badge">默认关闭</span>
+        {% endif %}
+      </div>
+      <div class="monitoring-control">
+        <p>开启后，NapCat/OneBot 收到的好友申请会自动同意；申请不会交给 AI，也不会把申请内容写入群聊上下文。请确认你接受陌生人加好友的账号风险。</p>
+        <form method="post" action="/friend-requests/toggle">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="enabled" value="{% if app_settings.get('auto_accept_friend_requests') %}false{% else %}true{% endif %}">
+          {% if app_settings.get('auto_accept_friend_requests') %}
+            <button class="button button-danger" type="submit">关闭自动通过</button>
+          {% else %}
+            <button class="button" type="submit">开启自动通过</button>
+          {% endif %}
+        </form>
+      </div>
     </section>
 
     <section class="admin-grid" id="admin-chat" aria-label="管理员与 AI 对话">
@@ -217,8 +270,10 @@
           {% for group in groups %}
           {% set group_id = group.get('group_id') %}
           {% set is_enabled = group.get('enabled', false) %}
+          {% set is_global_monitoring = app_state.get('auto_monitor_all_conversations') %}
+          {% set is_monitoring = is_enabled or is_global_monitoring %}
           {% set is_private = group.get('conversation_type') == 'private' or group_id.startswith('private:') %}
-          <article class="group-card {% if is_enabled %}group-enabled{% endif %}">
+          <article class="group-card {% if is_monitoring %}group-enabled{% endif %}">
             <div class="group-summary">
               <div>
                 <h3>{% if is_private %}私聊 · {% endif %}{{ group.get('group_name') or group.get('name') or ('会话 ' ~ group_id) }}</h3>
@@ -226,6 +281,8 @@
               </div>
               {% if is_enabled %}
                 <span class="badge badge-success">已启用</span>
+              {% elif is_global_monitoring %}
+                <span class="badge badge-success">全量监听</span>
               {% else %}
                 <span class="badge">未启用</span>
               {% endif %}
@@ -390,9 +447,9 @@
           {% endfor %}
         </div>
         {% else %}
-        <div class="empty-state">
+          <div class="empty-state">
           <strong>尚未发现群</strong>
-          <p>启动 QQNT/NapCat 并配置反向 WebSocket 后，此处会显示已发现的群和收到过消息的私聊。所有会话默认关闭，需手动启用监听。</p>
+          <p>启动 QQNT/NapCat 并配置反向 WebSocket 后，此处会显示已发现的群和收到过消息的私聊。当前可通过上方总开关决定是否自动加入监听。</p>
         </div>
         {% endif %}
       </section>
@@ -517,7 +574,7 @@
             </label>
             <label>
               <span>任务轮询间隔（秒）</span>
-              <input name="flow_video_poll_seconds" type="number" min="2" max="60" step="1" value="{{ app_settings.get('flow_video_poll_seconds', 5) }}">
+              <input name="flow_video_poll_seconds" type="number" min="2" max="60" step="1" value="{{ app_settings.get('flow_video_poll_seconds', 6) }}">
               <small>视频任务在后台独立轮询，不会阻塞群聊；提交后按 Flow 配置等待（默认 20 分钟），超时会记录真实错误并按一次性恢复策略处理，完成后自动发送 QQ 视频卡片。</small>
             </label>
             <label class="check-row">

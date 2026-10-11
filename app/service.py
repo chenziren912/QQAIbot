@@ -10,13 +10,14 @@ import json
 import logging
 import re
 import os
+import secrets
 import shutil
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 import httpx
@@ -24,7 +25,8 @@ import httpx
 from .config import AppSettings, SecretStore, VALID_LLM_ENDPOINT_MODES, migrate_legacy_global_prompt
 from .db import Database, json_loads
 from .flow_video import FlowVideoClient, FlowVideoError
-from .llm import AdminConversationClient, ChatCompletionsClient, redact_error_detail
+from .llm import AdminConversationClient, ChatCompletionsClient, TOOLS, redact_error_detail
+from .tool_facade import normalise_call
 from .markdown_render import MarkdownRenderError, render_markdown_images
 from .media import MediaError, MediaStore, image_file_to_data_uri
 from .music import (
@@ -155,6 +157,9 @@ MAX_YOUTUBE_URL_CHARS = 2_000
 MAX_YOUTUBE_DOWNLOAD_SECONDS = 600
 MAX_YOUTUBE_QUERY_CHARS = 500
 MAX_QQ_VIDEO_TRANSCODE_SECONDS = 900
+MAX_YTDLP_PROBE_SECONDS = 120
+MAX_YTDLP_PROBE_OUTPUT_CHARS = 2_000_000
+VIDEO_DOWNLOAD_CONFIRMATION_SECONDS = 600
 MAX_REMOTE_VIDEO_DOWNLOAD_ATTEMPTS = 3
 QQ_VIDEO_EXTENSIONS = frozenset(
     {".mp4", ".m4v", ".mkv", ".webm", ".mov", ".avi", ".flv", ".ts", ".m2ts", ".3gp"}
@@ -164,6 +169,30 @@ QQ_AUDIO_EXTENSIONS = frozenset(
 )
 MAX_QQ_VOICE_SEGMENT_SECONDS = DEFAULT_VOICE_SEGMENT_SECONDS
 MAX_QQ_VOICE_SEGMENTS = 120
+# yt-dlp's generic best-video selector may choose VP9/AV1/HEVC.  These
+# fallbacks keep the old 720P ceiling while preferring the AVC/H.264 streams
+# that QQ/NapCat handles most consistently.  The service still probes first;
+# these selectors are never allowed to silently download a non-H.264 source
+# without a conversation confirmation.
+DEFAULT_H264_FORMAT_SELECTOR = (
+    "bv*[height<=720][vcodec^=avc1]+ba/"
+    "b[height<=720][vcodec^=avc1]/"
+    "bv*[height<=720][vcodec^=avc3]+ba/"
+    "b[height<=720][vcodec^=avc3]/"
+    "bv*[height<=720][vcodec^=h264]+ba/"
+    "b[height<=720][vcodec^=h264]"
+)
+DEFAULT_FALLBACK_FORMAT_SELECTOR = "bv*[height<=720]+ba/b[height<=720]"
+# Measured on the current machine (i7-1165G7, libx264 veryfast, 30 s
+# synthetic sources, exact QQ transcode arguments).  Values are ranges rather
+# than promises: scene complexity, thermal throttling and concurrent work can
+# move the real time.  Upload time is deliberately not included.
+VIDEO_TRANSCODE_BENCHMARK_SECONDS = {
+    "360": (1.8, 2.1),
+    "480": (2.6, 2.8),
+    "720": (5.3, 6.8),
+    "1080": (18.3, 19.9),
+}
 # ``execute_command`` is intentionally unrestricted apart from one narrow
 # machine-safety boundary: commands that change the host power/session state.
 # Keep these patterns conservative about ordinary file names but broad enough
@@ -284,6 +313,7 @@ _BUSY_TOOL_PROGRESS_LABELS = {
     "Builtin_render_markdown_image": "渲染 Markdown 图片",
     "Builtin_bilibili_download": "下载视频",
     "Builtin_youtube_download": "下载 YouTube 视频",
+    "Builtin_video_download_confirmation": "确认视频下载",
     "Builtin_music_download": "下载音乐并转换语音",
     "Builtin_video_understanding": "分析视频",
     "Builtin_pdf_understanding": "读取 PDF",
@@ -314,7 +344,7 @@ FLOW_VIDEO_POLL_TIMEOUT_SECONDS = 45
 # still perform a strict Flow readiness check before returning its job ID.
 # Give that handshake enough time without extending ordinary status/download
 # requests or the 20-minute browser generation deadline.
-FLOW_VIDEO_CREATE_TIMEOUT_SECONDS = 180
+FLOW_VIDEO_CREATE_TIMEOUT_SECONDS = 20 * 60
 # A Flow browser wait can time out even when the remote job was accepted.  A
 # single durable retry is useful for this very specific post-submit timeout,
 # but repeating it indefinitely would spend credits and could duplicate a
@@ -420,16 +450,15 @@ _CLEAR_GROUP_CALL_PATTERN = re.compile(
 )
 
 # This is intentionally narrower than ordinary conversation: it marks an
-# actual current task aimed at the Agent even without an @.  Its purpose is not
-# to make the bot chat more often or to force an early reply; it only lets the
-# finalization layer tell the requester an honest tool error when a long task
-# (for example, "深度理解这个视频，生成文字稿 Markdown 并渲染图片") terminates
-# and the model fails to emit a final response.
+# actual current task aimed at the Agent even without an @.  It ensures the
+# result (or an honest failure) is returned in the same live turn, and is not
+# silently left in the internal rolling summary.  It does not force a reply
+# before the task's tools run.
 _EXPLICIT_AGENT_TASK_REQUEST_PATTERN = re.compile(
     r"""
     (?:
         (?:请|麻烦|拜托|帮(?:我)?|能不能|可以|需要|想让|让|给我|请你)?\s*
-        (?:深度\s*)?(?:理解|分析|解读|总结|生成|写(?:一)?|制作|渲染|下载|搜索|查询|查找|读取|处理|查看|看(?:看|下|一下))
+        (?:深度\s*)?(?:理解|分析|解读|总结|生成|写(?:一)?|制作|渲染|下载|搜索|查询|查找|找|推荐|读取|处理|查看|看(?:看|下|一下))
         [^\n。！？!?]{0,180}
         (?:视频|影片|文件|图片|链接|网页|文章|文字稿|markdown|md|题解|代码|公式|pdf|pptx?|word|表格|文档)
     )
@@ -438,7 +467,7 @@ _EXPLICIT_AGENT_TASK_REQUEST_PATTERN = re.compile(
         (?:视频|影片|文件|图片|链接|网页|文章|文字稿|markdown|md|题解|代码|公式|pdf|pptx?|word|表格|文档)
         [^\n。！？!?]{0,100}
         (?:请|麻烦|帮(?:我)?|能不能|可以|需要|想让|让|给我|请你)?\s*
-        (?:深度\s*)?(?:理解|分析|解读|总结|生成|写(?:一)?|制作|渲染|下载|搜索|查询|查找|读取|处理|查看|看(?:看|下|一下))
+        (?:深度\s*)?(?:理解|分析|解读|总结|生成|写(?:一)?|制作|渲染|下载|搜索|查询|查找|找|推荐|读取|处理|查看|看(?:看|下|一下))
     )
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -762,6 +791,14 @@ def _find_local_executable(name: str) -> str:
             candidate = candidate / (name + ".exe")
         if candidate.is_file():
             return str(candidate)
+    if name.casefold() == "ffprobe":
+        ffmpeg_override = _as_string(os.environ.get("FFMPEG_PATH")).strip()
+        if ffmpeg_override:
+            sibling = Path(ffmpeg_override).expanduser()
+            if sibling.is_file():
+                candidate = sibling.with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+                if candidate.is_file():
+                    return str(candidate)
     for executable_name in (name, name + ".exe"):
         found = shutil.which(executable_name)
         if found:
@@ -811,11 +848,42 @@ def _yt_dlp_authentication_warning(output: str, provider: str) -> str:
     return ""
 
 
+def _yt_dlp_failure_message(provider: str, output: str, *, phase: str = "") -> str:
+    """Turn a bounded yt-dlp diagnostic into a truthful short error.
+
+    The probe runs before the actual download, so callers still need the
+    familiar provider-specific messages (notably HTTP 403) for dashboards and
+    existing integrations. The raw bounded output is returned separately;
+    this helper never includes cookie values.
+    """
+
+    lowered = _as_string(output).casefold()
+    prefix = (provider + (" " + phase if phase else "")).strip()
+    if "http error 403" in lowered or "403 forbidden" in lowered or "forbidden" in lowered:
+        return "%s 返回 HTTP 403；未开始下载。" % prefix
+    if "sign in to confirm" in lowered or "not logged in" in lowered or "login required" in lowered:
+        return "%s 要求登录或当前 cookies 已失效；未开始下载。" % prefix
+    if "geo" in lowered and ("block" in lowered or "unavailable" in lowered):
+        return "%s 受到地区限制；未开始下载。" % prefix
+    return "%s 失败；未开始下载。" % (prefix or provider)
+
+
 def _yt_dlp_result_metadata(output: str) -> Dict[str, str]:
     """Parse only the explicit metadata lines requested from yt-dlp."""
 
     result: Dict[str, str] = {}
-    prefixes = {"id": "id", "title": "title", "webpage_url": "url"}
+    prefixes = {
+        "id": "id",
+        "title": "title",
+        "webpage_url": "url",
+        "video_codec": "video_codec",
+        "audio_codec": "audio_codec",
+        "width": "width",
+        "height": "height",
+        "duration": "duration",
+        "tbr": "tbr",
+        "ext": "ext",
+    }
     for raw_line in _as_string(output).splitlines():
         line = raw_line.strip()
         for prefix, key in prefixes.items():
@@ -824,6 +892,105 @@ def _yt_dlp_result_metadata(output: str) -> Dict[str, str]:
                 result[key] = line[len(marker) :].strip()[:2_000]
                 break
     return result
+
+
+def _is_h264_codec(value: Any) -> bool:
+    codec = _as_string(value).strip().casefold()
+    return codec.startswith(("avc1", "avc3", "h264"))
+
+
+def _probe_h264_formats(info: Mapping[str, Any]) -> Dict[str, Any]:
+    """Summarise yt-dlp's JSON probe without retaining provider payloads."""
+
+    formats = info.get("formats") if isinstance(info, Mapping) else []
+    if not isinstance(formats, list):
+        formats = []
+    h264: List[Dict[str, Any]] = []
+    max_height = 0
+    for item in formats:
+        if not isinstance(item, Mapping) or not _is_h264_codec(item.get("vcodec")):
+            continue
+        height = _safe_int(item.get("height"))
+        if height > 0:
+            max_height = max(max_height, height)
+        h264.append(
+            {
+                "format_id": _as_string(item.get("format_id"))[:80],
+                "vcodec": _as_string(item.get("vcodec"))[:80],
+                "acodec": _as_string(item.get("acodec"))[:80],
+                "height": height,
+                "width": _safe_int(item.get("width")),
+                "ext": _as_string(item.get("ext"))[:20],
+                "tbr": item.get("tbr"),
+            }
+        )
+        h264.sort(key=lambda item: (int(item.get("height") or 0), float(item.get("tbr") or 0)), reverse=True)
+    if not h264 and _is_h264_codec(info.get("vcodec")):
+        top_level_height = _safe_int(info.get("height"))
+        max_height = max(max_height, top_level_height)
+        h264.append(
+            {
+                "format_id": _as_string(info.get("format_id"))[:80],
+                "vcodec": _as_string(info.get("vcodec"))[:80],
+                "acodec": _as_string(info.get("acodec"))[:80],
+                "height": top_level_height,
+                "width": _safe_int(info.get("width")),
+                "ext": _as_string(info.get("ext"))[:20],
+                "tbr": info.get("tbr"),
+            }
+        )
+    # The default QQ selector deliberately caps video at 720P.  A source
+    # exposing only 1080P H.264 must therefore not be reported as directly
+    # usable: it will take the same explicit confirmation path as any other
+    # source that cannot satisfy the safe selector.
+    usable_h264 = [
+        item for item in h264 if 0 < _safe_int(item.get("height")) <= 720
+    ]
+    return {
+        "h264_available": bool(usable_h264),
+        "h264_formats": usable_h264[:12],
+        "max_h264_height": max_height,
+        "resolved_url": _as_string(info.get("webpage_url") or info.get("original_url"))[:2_000],
+        "title": _as_string(info.get("title"))[:2_000],
+        "duration": info.get("duration"),
+    }
+
+
+def _video_height_from_metadata(metadata: Mapping[str, Any]) -> int:
+    height = _safe_int(metadata.get("height") or metadata.get("max_h264_height"))
+    if height <= 0:
+        return 720
+    if height <= 360:
+        return 360
+    if height <= 480:
+        return 480
+    if height <= 720:
+        return 720
+    return 1080
+
+
+def _estimate_video_transcode_seconds(metadata: Mapping[str, Any]) -> Dict[str, Any]:
+    bucket = str(_video_height_from_metadata(metadata))
+    low, high = VIDEO_TRANSCODE_BENCHMARK_SECONDS.get(bucket, VIDEO_TRANSCODE_BENCHMARK_SECONDS["720"])
+    return {
+        "height_bucket": int(bucket),
+        "seconds_min": low,
+        "seconds_max": high,
+        "includes_upload": False,
+        "benchmark": "本机 i7-1165G7 / libx264 veryfast / 30 秒基准",
+    }
+
+
+def _video_probe_summary(info: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return bounded metadata safe to place in a tool result or audit."""
+
+    summary = _probe_h264_formats(info)
+    for key in ("duration", "title"):
+        value = summary.get(key)
+        if value in (None, ""):
+            summary.pop(key, None)
+    summary["estimated_transcode"] = _estimate_video_transcode_seconds(summary)
+    return summary
 
 
 def _structured_reply_target_message_ids(raw: Dict[str, Any]) -> List[str]:
@@ -1258,6 +1425,15 @@ class AgentService:
             and migrate_legacy_global_prompt(saved_global_prompt) != saved_global_prompt
         ):
             self.db.set_json_setting("app_settings", self.settings.as_mapping())
+        # Make the new default explicit in existing data directories.  The
+        # value still comes from ``AppSettings.from_mapping`` when the setting
+        # is absent, but persisting it makes the dashboard toggle's default
+        # visible and stable before the operator submits any form.
+        if isinstance(saved_settings, dict) and (
+            "auto_monitor_all_conversations" not in saved_settings
+            or "auto_accept_friend_requests" not in saved_settings
+        ):
+            self.db.set_json_setting("app_settings", self.settings.as_mapping())
         # A failed WAL setup is intentionally non-fatal when SQLite could
         # safely fall back to a single-file journal.  Surface the exact local
         # condition in the dashboard instead of hiding it behind a startup
@@ -1312,6 +1488,12 @@ class AgentService:
         # per job so a timeout never creates two replacement tasks.
         self._flow_video_failure_locks: Dict[str, asyncio.Lock] = {}
         self._history_backfill_groups: set[str] = set()
+        # Operator-controlled global monitor switch.  It intentionally does
+        # not change each conversation's durable enabled flag, so turning the
+        # switch off restores the per-conversation choices.
+        self._auto_monitor_all_conversations = bool(self.settings.auto_monitor_all_conversations)
+        self._auto_monitor_lock: Optional[asyncio.Lock] = None
+        self._handled_friend_request_flags: Set[str] = set()
         # A provider can return a refusal/error as ordinary text.  Allow one
         # automatic summary-only recomputation, then stop until the operator
         # retries so a persistent refusal cannot create an infinite API loop.
@@ -1334,6 +1516,12 @@ class AgentService:
     async def start(self) -> None:
         self._stopping = False
         self._async_locks()
+        stale_video_confirmations = self.db.recover_video_download_confirmations()
+        if stale_video_confirmations:
+            logger.warning(
+                "marked %s interrupted video download confirmation(s) failed; no automatic replay",
+                stale_video_confirmations,
+            )
         stale_turns = self.db.cancel_running_turns("service restarted before the turn finished")
         if stale_turns:
             logger.warning("cancelled %s stale running turn(s) from a previous service process", stale_turns)
@@ -1346,7 +1534,7 @@ class AgentService:
         # Repair a corrupt legacy summary even when no new QQ event arrives;
         # the resulting archive-only worker recomputes the bounded interval.
         for group in self.db.list_groups():
-            if not group.get("enabled"):
+            if not self._conversation_enabled_for_runtime(group):
                 continue
             group_id = _as_string(group.get("group_id"))
             if not group_id:
@@ -1370,6 +1558,8 @@ class AgentService:
             )
         if self.adapter and self.adapter.connected:
             await self.sync_groups()
+            if self._auto_monitor_all_conversations:
+                await self._auto_monitor_known_conversations()
 
     def _async_locks(self) -> Tuple[asyncio.Lock, asyncio.Lock]:
         if self._worker_lock is None:
@@ -1391,6 +1581,13 @@ class AgentService:
         if self._admin_chat_lock is None:
             self._admin_chat_lock = asyncio.Lock()
         return self._admin_chat_lock
+
+    def _auto_monitor_mutex(self) -> asyncio.Lock:
+        """Lazily create the lock used by global auto-listening."""
+
+        if self._auto_monitor_lock is None:
+            self._auto_monitor_lock = asyncio.Lock()
+        return self._auto_monitor_lock
 
     async def stop(self) -> None:
         self._stopping = True
@@ -1444,11 +1641,13 @@ class AgentService:
         return task
 
     async def _group_discovery_loop(self) -> None:
-        """Refresh known groups without ever auto-enabling collection."""
+        """Refresh known conversations and honor the global monitor switch."""
 
         while not self._stopping:
             if self.adapter and self.adapter.connected:
                 await self.sync_groups()
+                if self._auto_monitor_all_conversations:
+                    await self._auto_monitor_known_conversations()
             await asyncio.sleep(30)
 
     async def _sync_after_connection(self, adapter: OneBotAdapter, previous_connection_id: int) -> None:
@@ -1461,6 +1660,8 @@ class AgentService:
             if adapter.connected and adapter.connection_id > previous_connection_id:
                 await self.sync_groups()
                 await self._recover_enabled_groups_after_reconnect(adapter)
+                if self._auto_monitor_all_conversations:
+                    await self._auto_monitor_known_conversations()
                 return
             await asyncio.sleep(0.05)
 
@@ -1483,6 +1684,8 @@ class AgentService:
             "flow_video_api_key_configured": bool(os.environ.get("FLOW_API_KEY", "").strip()),
             "api_key_configured": bool(self.secret_store.get_llm_api_key()),
             "onebot_token_configured": bool(self.settings.onebot_token),
+            "auto_monitor_all_conversations": self._auto_monitor_all_conversations,
+            "auto_accept_friend_requests": self.settings.auto_accept_friend_requests,
         }
 
     def rules_text(self) -> str:
@@ -1782,6 +1985,14 @@ class AgentService:
         # explicitly replaced rather than merged with the old setting.
         if "flow_video_auto_send" in values:
             self.settings.flow_video_auto_send = bool(values.get("flow_video_auto_send"))
+        if "auto_monitor_all_conversations" in values:
+            requested_monitor_all = bool(values.get("auto_monitor_all_conversations"))
+            if requested_monitor_all != self._auto_monitor_all_conversations:
+                await self.set_auto_monitor_all(requested_monitor_all)
+            else:
+                self.settings.auto_monitor_all_conversations = requested_monitor_all
+        if "auto_accept_friend_requests" in values:
+            self.settings.auto_accept_friend_requests = bool(values.get("auto_accept_friend_requests"))
         self.media.set_budget_bytes(self.settings.media_budget_gib * 1024 ** 3)
 
         token_input = _as_string(values.get("onebot_token", "")).strip()
@@ -1822,6 +2033,86 @@ class AgentService:
                         self.db.upsert_group(group_id, _as_string(item.get("group_name") or item.get("name")))
             except Exception as exc:
                 self.runtime_warning = "无法同步群列表：" + str(exc)
+
+    def _conversation_enabled_for_runtime(self, group: Mapping[str, Any]) -> bool:
+        """Return whether a conversation is currently allowed to be processed."""
+
+        return bool(group.get("enabled")) or self._auto_monitor_all_conversations
+
+    async def _auto_monitor_conversation(self, conversation_id: str) -> bool:
+        """Initialize one conversation while global monitoring is enabled."""
+
+        if not self._auto_monitor_all_conversations:
+            return False
+        target = _as_string(conversation_id).strip()
+        if not target:
+            return False
+        async with self._auto_monitor_mutex():
+            if not self._auto_monitor_all_conversations:
+                return False
+            group = self.db.get_group(target)
+            if not group:
+                return False
+            if not group.get("initialized"):
+                await self._initialize_group(target)
+            else:
+                # A previously disabled conversation can have durable pending
+                # work.  Wake it without changing its persistent enabled flag.
+                if self.db.pending_events(target) or self.db.memory_pending_events(target, limit=1):
+                    await self._schedule_worker(target)
+            current = self.db.get_group(target) or group
+            return bool(current.get("initialized"))
+
+    async def _auto_monitor_known_conversations(self) -> Dict[str, int]:
+        """Initialize all currently known conversations without changing per-conversation flags."""
+
+        initialized = 0
+        failed = 0
+        for group in self.db.list_groups():
+            if not self._auto_monitor_all_conversations:
+                break
+            conversation_id = _as_string(group.get("group_id"))
+            if not conversation_id:
+                continue
+            try:
+                if await self._auto_monitor_conversation(conversation_id):
+                    initialized += 1
+                else:
+                    failed += 1
+            except Exception as exc:
+                failed += 1
+                self.db.set_group_error(conversation_id, "全量监听初始化失败：" + str(exc))
+        return {"known": len(self.db.list_groups()), "initialized": initialized, "failed": failed}
+
+    async def set_auto_monitor_all(self, enabled: bool) -> Dict[str, Any]:
+        """Toggle the persistent global monitor switch and apply it immediately."""
+
+        self._auto_monitor_all_conversations = bool(enabled)
+        self.settings.auto_monitor_all_conversations = bool(enabled)
+        self.db.set_json_setting("app_settings", self.settings.as_mapping())
+        if enabled:
+            await self.sync_groups()
+            details = await self._auto_monitor_known_conversations()
+            return {"enabled": True, **details}
+
+        # Stop only workers that were running solely because of the global
+        # override. Persistently enabled conversations continue uninterrupted.
+        to_cancel: List[asyncio.Task[Any]] = []
+        for conversation_id, task in list(self._workers.items()):
+            group = self.db.get_group(conversation_id) or {}
+            if not group.get("enabled") and not task.done():
+                task.cancel()
+                to_cancel.append(task)
+        if to_cancel:
+            await asyncio.gather(*to_cancel, return_exceptions=True)
+        return {"enabled": False, "known": len(self.db.list_groups()), "cancelled_workers": len(to_cancel)}
+
+    async def set_auto_accept_friend_requests(self, enabled: bool) -> Dict[str, Any]:
+        """Persist the local opt-in switch for automatically accepting friends."""
+
+        self.settings.auto_accept_friend_requests = bool(enabled)
+        self.db.set_json_setting("app_settings", self.settings.as_mapping())
+        return {"enabled": self.settings.auto_accept_friend_requests}
 
     async def enable_group(self, group_id: str, prompt_override: str, reasoning_effort: str) -> None:
         effort = reasoning_effort if reasoning_effort in VALID_REASONING_EFFORTS else "inherit"
@@ -1940,7 +2231,7 @@ class AgentService:
         for group in self.db.list_groups():
             if self._stopping or adapter is not self.adapter or not adapter.connected:
                 return
-            if not group.get("enabled"):
+            if not self._conversation_enabled_for_runtime(group):
                 continue
             group_id = _as_string(group.get("group_id"))
             if not group_id:
@@ -2030,6 +2321,10 @@ class AgentService:
     async def handle_onebot_event(self, raw: Dict[str, Any]) -> None:
         if self._stopping or not isinstance(raw, dict):
             return
+        if _as_string(raw.get("post_type")) == "request":
+            if _as_string(raw.get("request_type")).strip().lower() == "friend":
+                await self._handle_friend_add_request(raw)
+            return
         if _as_string(raw.get("post_type")) == "meta_event":
             self._track_background_task(self.sync_groups())
             return
@@ -2042,8 +2337,13 @@ class AgentService:
             _conversation_type(group_id),
         )
         group = self.db.get_group(group_id)
-        if not group or not group.get("enabled"):
-            return  # Disabled groups are intentionally not persisted or sent to the model.
+        if not group:
+            return
+        if not group.get("enabled") and self._auto_monitor_all_conversations:
+            await self._auto_monitor_conversation(group_id)
+            group = self.db.get_group(group_id)
+        if not group or not self._conversation_enabled_for_runtime(group):
+            return  # Disabled conversations remain ignored when the global switch is off.
         event = normalise_onebot_event(raw)
         # Some OneBot adapters omit `self_id` on an echo.  The application
         # records the returned message id before this check in the normal case,
@@ -2082,6 +2382,42 @@ class AgentService:
             # useful than the primary Agent's actual reply.  The event stays
             # durably queued and the primary worker remains strictly serial.
             await self._schedule_worker(group_id)
+
+    async def _handle_friend_add_request(self, raw: Dict[str, Any]) -> None:
+        """Optionally approve one incoming OneBot friend request.
+
+        Friend requests are deliberately handled outside conversation storage:
+        an incoming request has no group/private conversation ID and must not
+        be handed to the LLM as ordinary chat content.
+        """
+
+        if not self.settings.auto_accept_friend_requests:
+            return
+        flag = _as_string(raw.get("flag")).strip()
+        user_id = _as_string(raw.get("user_id")).strip()
+        if not flag:
+            logger.warning("ignoring friend request without a flag (user=%s)", user_id or "unknown")
+            return
+        if flag in self._handled_friend_request_flags:
+            return
+        if not self.adapter or not self.adapter.connected:
+            logger.warning("cannot approve friend request while OneBot is disconnected (user=%s)", user_id or "unknown")
+            self.runtime_warning = "好友申请未自动通过：OneBot 当前未连接。"
+            return
+        params: Dict[str, Any] = {"flag": flag, "approve": True}
+        remark = _as_string(self.settings.friend_request_remark).strip()
+        if remark:
+            params["remark"] = remark
+        try:
+            await self.adapter.call("set_friend_add_request", params)
+        except Exception as exc:
+            logger.exception("could not approve friend request from %s", user_id or "unknown")
+            self.runtime_warning = "自动通过好友申请失败：" + str(exc)
+            return
+        self._handled_friend_request_flags.add(flag)
+        if len(self._handled_friend_request_flags) > 4096:
+            self._handled_friend_request_flags = set(list(self._handled_friend_request_flags)[-2048:])
+        logger.info("approved incoming friend request from user=%s", user_id or "unknown")
 
     def _set_worker_activity(
         self,
@@ -2298,7 +2634,7 @@ class AgentService:
             if not self._primary_worker_still_active(group_id, expected_worker):
                 return
             group = self.db.get_group(group_id)
-            if not group or not group.get("enabled"):
+            if not group or not self._conversation_enabled_for_runtime(group):
                 return
             text = self._normalise_busy_reply_text(generated)
             if not text:
@@ -2494,7 +2830,7 @@ class AgentService:
         safety_warning = ""
         while not self._stopping:
             group = self.db.get_group(group_id)
-            if not group or not group.get("enabled"):
+            if not group or not self._conversation_enabled_for_runtime(group):
                 return
             self._ensure_summary_checkpoint(group_id)
             pending = self.db.pending_events(group_id)
@@ -2588,6 +2924,13 @@ class AgentService:
                 return
             trigger_event_ids = [int(event["id"]) for event in trigger_batch]
             archive_event_ids = [int(event["id"]) for event in archive_batch]
+            actor_id_for_turn = ""
+            for live_event in reversed(trigger_batch):
+                actor_id_for_turn = _as_string(
+                    live_event.get("sender_id") or live_event.get("user_id")
+                ).strip()
+                if actor_id_for_turn:
+                    break
             # Durable QQ-action slots are scoped to the new live input where
             # possible.  A pure archival turn has no live trigger, so its old
             # archive batch provides the deterministic scope instead.
@@ -2630,6 +2973,9 @@ class AgentService:
                     trigger_batch,
                     include_direct_mention_marker=True,
                 ) if trigger_batch else ""
+                pending_video_confirmation = self.db.get_active_video_download_confirmation(group_id)
+                if pending_video_confirmation and current_event_text:
+                    current_event_text += "\n\n" + self._video_confirmation_context(pending_video_confirmation)
                 group_prompt_for_turn = _as_string(group.get("prompt_override"))
                 persistent_rules_for_turn = self.rules_text()
                 previous_summary_for_turn = self.db.get_summary(group_id)
@@ -2686,7 +3032,7 @@ class AgentService:
                     else await self._prepare_image_parts(trigger_batch or archive_batch)
                 )
                 current_group = self.db.get_group(group_id)
-                if self._stopping or not current_group or not current_group.get("enabled"):
+                if self._stopping or not current_group or not self._conversation_enabled_for_runtime(current_group):
                     self.db.finish_turn(turn_id, "cancelled", error="group disabled before LLM request")
                     return
                 effort = self._resolve_reasoning_effort(group)
@@ -2729,6 +3075,7 @@ class AgentService:
                             trusted_reply_message_ids=trusted_reply_ids,
                             allow_user_facing_group_summary=allow_user_facing_group_summary,
                             rolling_summary_candidates=rolling_summary_candidates,
+                            actor_id=actor_id_for_turn,
                         )
                     finally:
                         self._set_worker_activity(
@@ -2767,7 +3114,7 @@ class AgentService:
                     preferred_initial_tool=preferred_initial_tool,
                 )
                 current_group = self.db.get_group(group_id)
-                if self._stopping or not current_group or not current_group.get("enabled"):
+                if self._stopping or not current_group or not self._conversation_enabled_for_runtime(current_group):
                     self.db.finish_turn(turn_id, "cancelled", error="group disabled during LLM request")
                     return
                 if not self._summary_is_usable(result.summary):
@@ -4113,6 +4460,158 @@ class AgentService:
             "voice_format": "mp3->NapCat record",
         }
 
+    async def _probe_media_file(self, source: Path) -> Dict[str, Any]:
+        """Read local codec/container metadata without decoding the media."""
+
+        def failure(reason: str) -> Dict[str, Any]:
+            return {"_probe_ok": False, "_probe_error": reason[:600]}
+
+        ffprobe = _find_local_executable("ffprobe")
+        if not ffprobe or not source.is_file():
+            return failure("未找到 ffprobe 或文件不存在")
+        command = [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=index,codec_type,codec_name,codec_tag_string,profile,level,width,height,pix_fmt,sample_rate,channels:format=format_name",
+            "-of",
+            "json",
+            str(source),
+        ]
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(source.parent),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "PATH": str(Path(ffprobe).parent) + os.pathsep + os.environ.get("PATH", ""),
+                },
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=30)
+        except (OSError, asyncio.TimeoutError):
+            try:
+                if process is not None:
+                    process.kill()
+                    await process.communicate()
+            except Exception:
+                pass
+            return failure("ffprobe 启动失败或超时")
+        if process.returncode != 0 or not stdout:
+            return failure("ffprobe 没有返回有效媒体元数据")
+        try:
+            value = json.loads(stdout.decode("utf-8", errors="replace"))
+        except (TypeError, ValueError, UnicodeError):
+            return failure("ffprobe 返回的 JSON 无效")
+        if not isinstance(value, Mapping):
+            return failure("ffprobe 返回的内容不是对象")
+        result = dict(value)
+        result["_probe_ok"] = True
+        return result
+
+    @staticmethod
+    def _is_faststart_mp4(source: Path) -> bool:
+        """Return whether an MP4 has its top-level ``moov`` before ``mdat``.
+
+        ffprobe reports codecs and the container but does not guarantee the
+        atom order that makes a QQ upload playable before the whole file is
+        downloaded.  Parse only the bounded top-level atom headers here; a
+        failed/unsupported parse is intentionally treated as not fast-start.
+        """
+
+        try:
+            with Path(source).open("rb") as handle:
+                saw_mdat = False
+                for _ in range(128):
+                    header = handle.read(8)
+                    if len(header) < 8:
+                        return False
+                    size = int.from_bytes(header[:4], "big")
+                    atom = header[4:8]
+                    header_size = 8
+                    if size == 1:
+                        extended = handle.read(8)
+                        if len(extended) < 8:
+                            return False
+                        size = int.from_bytes(extended, "big")
+                        header_size = 16
+                    if size == 0:
+                        # A zero-sized mdat extends to EOF; it cannot be
+                        # followed by a moov atom in a fast-start file.
+                        return atom == b"moov" and not saw_mdat
+                    if size < header_size:
+                        return False
+                    if atom == b"mdat":
+                        saw_mdat = True
+                    elif atom == b"moov":
+                        return not saw_mdat
+                    if size > header_size:
+                        handle.seek(size - header_size, os.SEEK_CUR)
+                return False
+        except (OSError, ValueError):
+            return False
+
+    @staticmethod
+    def _qq_video_compatibility(
+        metadata: Mapping[str, Any],
+        source: Optional[Path] = None,
+    ) -> Tuple[bool, bool, Dict[str, Any]]:
+        """Return ``(full_copy_ok, video_copy_audio_transcode, details)``."""
+
+        streams = metadata.get("streams") if isinstance(metadata, Mapping) else []
+        if not isinstance(streams, list):
+            streams = []
+        video = next((item for item in streams if isinstance(item, Mapping) and item.get("codec_type") == "video"), None)
+        audio = next((item for item in streams if isinstance(item, Mapping) and item.get("codec_type") == "audio"), None)
+        format_name = _as_string((metadata.get("format") or {}).get("format_name") if isinstance(metadata.get("format"), Mapping) else "").casefold()
+        video_codec = _as_string(video.get("codec_name") if isinstance(video, Mapping) else "").casefold()
+        video_tag = _as_string(video.get("codec_tag_string") if isinstance(video, Mapping) else "").casefold()
+        profile = _as_string(video.get("profile") if isinstance(video, Mapping) else "").casefold()
+        pix_fmt = _as_string(video.get("pix_fmt") if isinstance(video, Mapping) else "").casefold()
+        width = _safe_int(video.get("width") if isinstance(video, Mapping) else 0)
+        height = _safe_int(video.get("height") if isinstance(video, Mapping) else 0)
+        level = _safe_int(video.get("level") if isinstance(video, Mapping) else 0)
+        video_ok = (
+            video_codec == "h264"
+            and video_tag in {"", "avc1", "avc3"}
+            and profile in {"", "constrained baseline", "baseline", "main", "high", "constrained high"}
+            and (not level or level <= 41)
+            and pix_fmt == "yuv420p"
+            and width > 0
+            and height > 0
+            and width % 2 == 0
+            and height % 2 == 0
+        )
+        audio_codec = _as_string(audio.get("codec_name") if isinstance(audio, Mapping) else "").casefold()
+        channels = _safe_int(audio.get("channels") if isinstance(audio, Mapping) else 0)
+        audio_ok = not audio or (audio_codec == "aac" and (not channels or channels <= 2))
+        container_ok = "mp4" in format_name
+        faststart_ok = bool(
+            container_ok
+            and source is not None
+            and AgentService._is_faststart_mp4(Path(source))
+        )
+        full_copy_ok = bool(video_ok and audio_ok and container_ok and faststart_ok)
+        video_copy_audio_transcode = bool(video_ok and not full_copy_ok)
+        details = {
+            "format": format_name,
+            "container_ok": container_ok,
+            "faststart_ok": faststart_ok,
+            "video_codec": video_codec,
+            "video_tag": video_tag,
+            "audio_codec": audio_codec,
+            "width": width,
+            "height": height,
+            "pix_fmt": pix_fmt,
+            "profile": profile,
+            "level": level,
+            "mode": "copy" if full_copy_ok else ("audio_only" if video_copy_audio_transcode else "video_audio"),
+        }
+        return full_copy_ok, video_copy_audio_transcode, details
+
     async def _transcode_video_for_qq(self, source: Path) -> Path:
         """Normalize a video to the codec/container combination QQ can play.
 
@@ -4133,6 +4632,15 @@ class AgentService:
                 "未找到 ffmpeg，无法生成 QQ 可播放视频；请把 ffmpeg 加入服务进程 PATH "
                 "或设置 FFMPEG_PATH 为 ffmpeg.exe 的完整路径后重启服务。"
             )
+        media_metadata = await self._probe_media_file(source)
+        full_copy_ok, video_copy_audio_transcode, _compatibility = self._qq_video_compatibility(
+            media_metadata, source
+        )
+        if full_copy_ok:
+            # The source is already an MP4 with QQ-safe H.264/AAC streams.  It
+            # is safe to send it directly and avoids a needless generation
+            # loss and several seconds of CPU work.
+            return source
         suffix = ".qq.mp4"
         output = source.with_name(source.stem + suffix)
         if output == source:
@@ -4156,34 +4664,31 @@ class AgentService:
             "0:a:0?",
             "-sn",
             "-dn",
-            "-vf",
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-c:v",
-            "libx264",
-            "-tag:v",
-            "avc1",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-profile:v",
-            "main",
-            "-level:v",
-            "4.1",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            "-movflags",
-            "+faststart",
-            str(output),
         ]
+        if video_copy_audio_transcode:
+            command.extend([
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ar", "48000",
+                "-ac", "2",
+            ])
+        else:
+            command.extend([
+                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-c:v", "libx264",
+                "-tag:v", "avc1",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-profile:v", "main",
+                "-level:v", "4.1",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ar", "48000",
+                "-ac", "2",
+            ])
+        command.extend(["-movflags", "+faststart", str(output)])
         environment = {
             **os.environ,
             "PATH": str(Path(ffmpeg).parent) + os.pathsep + os.environ.get("PATH", ""),
@@ -4232,6 +4737,9 @@ class AgentService:
         if output.stat().st_size > MAX_VIDEO_FILE_BYTES:
             output.unlink(missing_ok=True)
             raise WorkspaceError("QQ 兼容视频超过 2 GiB，不能发送")
+        if not self._is_faststart_mp4(output):
+            output.unlink(missing_ok=True)
+            raise WorkspaceError("ffmpeg 输出未通过 MP4 fast-start 校验，不能发送")
         return output
 
     async def _send_video_to_conversation(
@@ -5284,10 +5792,301 @@ class AgentService:
         finally:
             shutil.rmtree(frame_dir, ignore_errors=True)
 
+    @staticmethod
+    def _video_confirmation_id() -> str:
+        return "vdconfirm_" + secrets.token_urlsafe(12)
+
+    @staticmethod
+    def _video_confirmation_text(metadata: Mapping[str, Any]) -> str:
+        estimate = metadata.get("estimated_transcode") if isinstance(metadata, Mapping) else {}
+        if not isinstance(estimate, Mapping):
+            estimate = {}
+        low = estimate.get("seconds_min")
+        high = estimate.get("seconds_max")
+        try:
+            estimate_text = "约 %.1f–%.1f 秒" % (float(low), float(high))
+        except (TypeError, ValueError):
+            estimate_text = "需要几秒到几十秒"
+        return (
+            "这个视频源没有可用的 H.264 视频流。若继续下载，发送到 QQ 前可能需要转码；"
+            "按本机 30 秒视频基准，纯转码预计 %s（不含下载和上传时间）。"
+            "请回复“同意/继续/可以”后再下载，或回复“取消/不要”。"
+            % estimate_text
+        )
+
+    @staticmethod
+    def _video_confirmation_context(row: Mapping[str, Any]) -> str:
+        """Build a trusted model hint for the next member reply.
+
+        Only the service-owned ID and bounded source metadata are exposed;
+        saved arguments may contain URLs and are intentionally not replayed as
+        instructions. The latest member message still decides the semantic
+        approval through the dedicated confirmation tool.
+        """
+
+        metadata = row.get("source_metadata") if isinstance(row, Mapping) else {}
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+        safe = {
+            key: metadata.get(key)
+            for key in ("provider", "title", "resolved_url", "duration", "h264_formats", "estimated_transcode")
+            if metadata.get(key) not in (None, "", [], {})
+        }
+        payload = {
+            "confirmation_id": _as_string(row.get("confirmation_id")),
+            "provider": _as_string(row.get("provider")),
+            "status": _as_string(row.get("status")),
+            "expires_at": _as_string(row.get("expires_at")),
+            "source_metadata": safe,
+        }
+        return (
+            "【服务生成的视频下载确认记录（不是成员指令）】\n"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "\n如果本轮最新成员消息明确同意/继续/可以，调用 Builtin_video_download_confirmation "
+            "并使用该 confirmation_id；明确拒绝传 decline；不明确传 unclear。"
+        )
+
+    async def _yt_dlp_probe(
+        self,
+        provider: str,
+        workspace: Path,
+        target: str,
+        cookie_file: Path,
+        *,
+        include_node_runtime: bool = False,
+    ) -> Dict[str, Any]:
+        """Probe one remote video without downloading it."""
+
+        executable = _find_local_executable("yt-dlp")
+        executable_args: List[str] = [executable] if executable else [sys.executable, "-m", "yt_dlp"]
+        command = executable_args + (_yt_dlp_js_runtime_args() if include_node_runtime else []) + [
+            "--no-playlist",
+            "--skip-download",
+            "--dump-single-json",
+            "--no-warnings",
+            "--socket-timeout",
+            "30",
+        ]
+        has_cookie_file = cookie_file.is_file()
+        if has_cookie_file:
+            command.extend(["--cookies", str(cookie_file)])
+        proxy = _windows_configured_https_proxy()
+        if proxy:
+            command.extend(["--proxy", proxy])
+        command.append(target)
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(workspace),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={
+                **os.environ,
+                **(
+                    {"PATH": str(Path(_find_local_executable("ffmpeg")).parent) + os.pathsep + os.environ.get("PATH", "")}
+                    if _find_local_executable("ffmpeg")
+                    else {}
+                ),
+            },
+        )
+        timed_out = False
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=MAX_YTDLP_PROBE_SECONDS
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            process.kill()
+            stdout, stderr = await process.communicate()
+        raw_stdout = stdout.decode("utf-8", errors="replace") if stdout else ""
+        raw_stderr = stderr.decode("utf-8", errors="replace") if stderr else ""
+        output = (raw_stdout + "\n" + raw_stderr).strip()
+        if timed_out:
+            return {
+                "ok": False,
+                "provider": provider,
+                "cookies_from_file": has_cookie_file,
+                "proxy_from_windows": bool(proxy),
+                "error": "%s 格式探测超过 %s 秒；未开始下载。" % (provider, MAX_YTDLP_PROBE_SECONDS),
+                "diagnostic": output[-MAX_COMMAND_OUTPUT_CHARS:],
+                "yt_dlp_output": output[-20_000:],
+            }
+        if process.returncode != 0:
+            return {
+                "ok": False,
+                "provider": provider,
+                "cookies_from_file": has_cookie_file,
+                "proxy_from_windows": bool(proxy),
+                "error": _yt_dlp_failure_message(provider, output),
+                "diagnostic": output[-MAX_COMMAND_OUTPUT_CHARS:],
+                "yt_dlp_output": output[-20_000:],
+            }
+        if len(raw_stdout) > MAX_YTDLP_PROBE_OUTPUT_CHARS:
+            return {
+                "ok": False,
+                "provider": provider,
+                "cookies_from_file": has_cookie_file,
+                "proxy_from_windows": bool(proxy),
+                "error": "%s 格式探测返回内容过大；未开始下载。" % provider,
+                "yt_dlp_output": raw_stdout[-20_000:],
+            }
+        try:
+            info = json.loads(raw_stdout)
+        except (TypeError, ValueError) as exc:
+            return {
+                "ok": False,
+                "provider": provider,
+                "cookies_from_file": has_cookie_file,
+                "proxy_from_windows": bool(proxy),
+                "error": "%s 格式探测返回的 JSON 无效；未开始下载。" % provider,
+                "diagnostic": redact_error_detail(exc, limit=600),
+                "yt_dlp_output": output[-20_000:],
+            }
+        if not isinstance(info, Mapping):
+            return {
+                "ok": False,
+                "provider": provider,
+                "cookies_from_file": has_cookie_file,
+                "proxy_from_windows": bool(proxy),
+                "error": "%s 格式探测没有返回视频对象；未开始下载。" % provider,
+                "yt_dlp_output": output[-20_000:],
+            }
+        metadata = _video_probe_summary(info)
+        metadata["provider"] = provider
+        metadata["cookies_from_file"] = has_cookie_file
+        metadata["proxy_from_windows"] = bool(proxy)
+        metadata["diagnostic"] = _yt_dlp_authentication_warning(output, provider)
+        return {"ok": True, "provider": provider, "metadata": metadata}
+
+    def _create_video_download_confirmation(
+        self,
+        conversation_id: str,
+        provider: str,
+        arguments: Dict[str, Any],
+        target: str,
+        metadata: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        confirmation_id = self._video_confirmation_id()
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=VIDEO_DOWNLOAD_CONFIRMATION_SECONDS)).isoformat()
+        row = self.db.create_video_download_confirmation(
+            confirmation_id,
+            conversation_id,
+            provider,
+            dict(arguments),
+            target,
+            dict(metadata),
+            "",
+            expires_at,
+        )
+        return {
+            "ok": False,
+            "retry_safe": True,
+            "qq_side_effect": False,
+            "required_tool": "send_group_message",
+            "user_visible_text": self._video_confirmation_text(metadata),
+            "awaiting_confirmation": True,
+            "confirmation_id": confirmation_id,
+            "confirmation_expires_at": expires_at,
+            "confirmation_status": row.get("status", "pending"),
+            "source_metadata": dict(metadata),
+            "error": "源站没有可用 H.264；已创建待确认记录，未开始下载。",
+        }
+
+    async def _confirm_video_download(
+        self,
+        conversation_id: str,
+        arguments: Dict[str, Any],
+        *,
+        actor_id: str = "",
+    ) -> Dict[str, Any]:
+        confirmation_id = _as_string(arguments.get("confirmation_id")).strip()
+        decision = _as_string(arguments.get("decision")).strip().lower()
+        if not confirmation_id or len(confirmation_id) > 160:
+            return {"ok": False, "retry_safe": True, "error": "confirmation_id 不能为空且格式无效"}
+        if decision not in {"approve", "decline", "unclear"}:
+            return {"ok": False, "retry_safe": True, "error": "decision 必须是 approve、decline 或 unclear"}
+        pending = self.db.get_video_download_confirmation(conversation_id, confirmation_id)
+        if not pending or _as_string(pending.get("status")).lower() not in {"pending", "approved"}:
+            return {"ok": False, "retry_safe": True, "error": "待确认的视频下载不存在、已过期或不属于当前会话"}
+        if decision == "unclear":
+            return {
+                "ok": True,
+                "awaiting_confirmation": True,
+                "confirmation_id": confirmation_id,
+                "confirmation_status": pending.get("status", "pending"),
+                "message": "当前回复没有明确表示同意或取消，继续等待明确确认。",
+            }
+        resolved = self.db.resolve_video_download_confirmation(
+            conversation_id,
+            confirmation_id,
+            decision,
+            actor_id=actor_id,
+        )
+        if not resolved:
+            return {"ok": False, "retry_safe": True, "error": "无法更新视频下载确认状态"}
+        expected_status = "approved" if decision == "approve" else "declined"
+        if _as_string(resolved.get("status")).lower() != expected_status:
+            return {
+                "ok": False,
+                "retry_safe": True,
+                "confirmation_id": confirmation_id,
+                "error": "这条视频下载确认已被其他回复处理，未重复下载。",
+            }
+        if decision == "decline":
+            self.db.finish_video_download_confirmation(conversation_id, confirmation_id, "declined")
+            return {
+                "ok": True,
+                "confirmation_id": confirmation_id,
+                "confirmation_status": "declined",
+                "download_started": False,
+                "message": "已取消这次非 H.264 视频下载。",
+            }
+        claimed = self.db.claim_video_download_confirmation(conversation_id, confirmation_id)
+        if not claimed:
+            return {
+                "ok": False,
+                "retry_safe": True,
+                "confirmation_id": confirmation_id,
+                "error": "这条视频下载确认已被处理，未重复下载。",
+            }
+        saved_arguments = claimed.get("arguments") if isinstance(claimed.get("arguments"), dict) else {}
+        provider = _as_string(claimed.get("provider")).strip().lower()
+        target = _as_string(claimed.get("target")).strip()
+        try:
+            if provider == "youtube":
+                result = await self._youtube_download(
+                    conversation_id,
+                    saved_arguments,
+                    allow_non_h264=True,
+                    target_override=target,
+                )
+            elif provider == "bilibili":
+                result = await self._bilibili_download(
+                    conversation_id,
+                    saved_arguments,
+                    allow_non_h264=True,
+                    target_override=target,
+                )
+            else:
+                result = {"ok": False, "error": "未知视频来源，未开始下载"}
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        self.db.finish_video_download_confirmation(
+            conversation_id,
+            confirmation_id,
+            "completed" if result.get("ok") is True else "failed",
+        )
+        result = dict(result)
+        result["confirmation_id"] = confirmation_id
+        result["confirmed_non_h264"] = True
+        return result
+
     async def _bilibili_download(
         self,
         conversation_id: str,
         arguments: Dict[str, Any],
+        *,
+        allow_non_h264: bool = False,
+        target_override: str = "",
     ) -> Dict[str, Any]:
         unknown = set(arguments).difference(BILIBILI_DOWNLOAD_ARGUMENTS)
         if unknown:
@@ -5299,11 +6098,47 @@ class AgentService:
             raise WorkspaceError("url 过长")
         if not _is_bilibili_url(url):
             raise WorkspaceError("仅支持 Bilibili 视频链接（bilibili.com、b23.tv 或 bili2233.cn）")
+        target = target_override.strip() or url
+        if not _is_bilibili_url(target):
+            raise WorkspaceError("Bilibili 格式探测结果不是受支持的官方链接")
         executable = _find_local_executable("yt-dlp")
         executable_args: List[str] = [executable] if executable else [sys.executable, "-m", "yt_dlp"]
         workspace = self.conversation_workspace(conversation_id)
         extension = _as_string(arguments.get("output_extension") or arguments.get("extension")).strip().lstrip(".")
-        format_selector = _as_string(arguments.get("format_selector") or arguments.get("format")).strip() or "bv*[height<=720]+ba/b[height<=720]/b"
+        requested_format = _as_string(arguments.get("format_selector") or arguments.get("format")).strip()
+        cookie_file = self.data_dir / "bilibili-cookies.txt"
+        probe = await self._yt_dlp_probe(
+            "Bilibili",
+            workspace,
+            target,
+            cookie_file,
+        )
+        if not probe.get("ok"):
+            return {
+                "ok": False,
+                "retry_safe": True,
+                "qq_side_effect": False,
+                "provider": "bilibili",
+                "cookies_from_file": cookie_file.is_file(),
+                "proxy_from_windows": bool(_windows_configured_https_proxy()),
+                "error": probe.get("error", "Bilibili 格式探测失败；未开始下载。"),
+                "diagnostic": probe.get("diagnostic", ""),
+                "yt_dlp_output": probe.get("yt_dlp_output", ""),
+            }
+        source_metadata = dict(probe.get("metadata") or {})
+        h264_available = bool(source_metadata.get("h264_available"))
+        audio_only = bool(arguments.get("audio_only", False))
+        if not audio_only and not h264_available and not allow_non_h264:
+            return self._create_video_download_confirmation(
+                conversation_id,
+                "bilibili",
+                arguments,
+                target,
+                source_metadata,
+            )
+        format_selector = requested_format or (
+            DEFAULT_H264_FORMAT_SELECTOR if h264_available else DEFAULT_FALLBACK_FORMAT_SELECTOR
+        )
         requested_filename = _as_string(arguments.get("filename")).strip()
         if requested_filename:
             requested_path = self.workspace.resolve(conversation_id, requested_filename)
@@ -5311,7 +6146,7 @@ class AgentService:
             if not requested_path.suffix:
                 output_template += ".%(ext)s"
         else:
-            output_template = str(workspace / "%(title)s.%(ext)s")
+            output_template = str(workspace / "%(title)s [%(id)s].%(ext)s")
         command = executable_args + [
             "--no-playlist",
             "--newline",
@@ -5325,6 +6160,16 @@ class AgentService:
             "title:%(title)s",
             "--print",
             "webpage_url:%(webpage_url)s",
+            "--print",
+            "after_move:video_codec:%(vcodec)s",
+            "--print",
+            "after_move:audio_codec:%(acodec)s",
+            "--print",
+            "after_move:width:%(width)s",
+            "--print",
+            "after_move:height:%(height)s",
+            "--print",
+            "after_move:ext:%(ext)s",
             "-f",
             format_selector,
         ]
@@ -5335,7 +6180,6 @@ class AgentService:
         # not fall back to a cookie for another site, a generic yt-dlp setting,
         # or a browser profile: those could silently send the wrong account's
         # credentials to a different service.
-        cookie_file = self.data_dir / "bilibili-cookies.txt"
         has_cookie_file = cookie_file.is_file()
         if has_cookie_file:
             command.extend(["--cookies", str(cookie_file)])
@@ -5348,9 +6192,8 @@ class AgentService:
             command.extend(["-x"])
             if extension:
                 command.extend(["--audio-format", extension])
-        command.extend(["-o", output_template, url])
+        command.extend(["-o", output_template, target])
         await self._send_tool_activity_notice(0, conversation_id, "Builtin_bilibili_download")
-        started = time.time()
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(workspace),
@@ -5382,8 +6225,6 @@ class AgentService:
             candidate = Path(line.strip().strip('"'))
             if candidate.is_file():
                 candidates.append(candidate)
-        if not candidates:
-            candidates = [path for path in workspace.glob("*") if path.is_file() and path.stat().st_mtime >= started]
         if timed_out:
             return {
                 "ok": False,
@@ -5396,6 +6237,7 @@ class AgentService:
                 "proxy_from_windows": bool(proxy),
                 "authentication_warning": authentication_warning,
                 "source_metadata": result_metadata,
+                "probe_metadata": source_metadata,
                 "error": "yt-dlp 下载超过 600 秒，已终止子进程；请检查 Bilibili 链接、网络或 cookie。",
             }
         if process.returncode != 0 or not candidates:
@@ -5417,6 +6259,7 @@ class AgentService:
                 "proxy_from_windows": bool(proxy),
                 "authentication_warning": authentication_warning,
                 "source_metadata": result_metadata,
+                "probe_metadata": source_metadata,
                 "error": error,
             }
         path = max(candidates, key=lambda item: item.stat().st_mtime)
@@ -5438,6 +6281,59 @@ class AgentService:
         # send_group_file(path=...) if the member actually asked to receive it.
         # In particular, a search result must never be sent before the Agent has
         # a chance to notice that yt-dlp selected the wrong video.
+        actual_metadata = dict(source_metadata)
+        actual_metadata.update(_yt_dlp_result_metadata(output))
+        local_metadata = await self._probe_media_file(path) if is_video else {}
+        local_streams = local_metadata.get("streams") if isinstance(local_metadata, Mapping) else []
+        has_video_stream = isinstance(local_streams, list) and any(
+            isinstance(item, Mapping) and _as_string(item.get("codec_type")).casefold() == "video"
+            for item in local_streams
+        )
+        if is_video and (local_metadata.get("_probe_ok") is not True or not has_video_stream):
+            probe_error = _as_string(local_metadata.get("_probe_error")) or "没有检测到视频流"
+            path.unlink(missing_ok=True)
+            return {
+                "ok": False,
+                "retry_safe": True,
+                "qq_side_effect": False,
+                "provider": "bilibili",
+                "probe_metadata": {"_probe_error": probe_error},
+                "error": "下载文件未通过 ffprobe 严格验证，已删除未验证文件：" + probe_error,
+            }
+        _copy_ok, _audio_only, local_compatibility = self._qq_video_compatibility(
+            local_metadata, path
+        )
+        if local_compatibility.get("video_codec"):
+            actual_metadata.update(
+                {
+                    "video_codec": local_compatibility.get("video_codec", ""),
+                    "audio_codec": local_compatibility.get("audio_codec", ""),
+                    "width": local_compatibility.get("width", 0),
+                    "height": local_compatibility.get("height", 0),
+                    "container": local_compatibility.get("format", ""),
+                }
+            )
+        codec_value = _as_string(actual_metadata.get("video_codec")).strip()
+        if is_video and not codec_value:
+            path.unlink(missing_ok=True)
+            return {
+                "ok": False,
+                "retry_safe": True,
+                "qq_side_effect": False,
+                "provider": "bilibili",
+                "probe_metadata": {"_probe_error": "ffprobe 未返回视频 codec_name"},
+                "error": "下载文件未通过 ffprobe 严格验证：缺少视频 codec_name，已删除未验证文件",
+            }
+        actual_h264 = not is_video or _is_h264_codec(codec_value)
+        if not actual_h264 and not allow_non_h264:
+            path.unlink(missing_ok=True)
+            return self._create_video_download_confirmation(
+                conversation_id,
+                "bilibili",
+                arguments,
+                target,
+                actual_metadata,
+            )
         return {
             "ok": True,
             "delivery": "workspace",
@@ -5448,12 +6344,19 @@ class AgentService:
             "file": relative_path,
             "filename": path.name,
             "url": url,
+            "resolved_url": target,
             "bytes": path.stat().st_size,
             "yt_dlp_output": output[-20_000:],
             "cookies_from_file": has_cookie_file,
             "proxy_from_windows": bool(proxy),
             "authentication_warning": authentication_warning,
             "source_metadata": result_metadata,
+            "probe_metadata": actual_metadata,
+            "h264_available": h264_available,
+            "video_codec": actual_metadata.get("video_codec", ""),
+            "audio_codec": actual_metadata.get("audio_codec", ""),
+            "format_selector": format_selector,
+            "confirmed_non_h264": bool(allow_non_h264 and not h264_available),
             "next_step": "先检查工作区文件；确认内容正确且需要发送时，再调用 send_group_file(path=该路径)。",
         }
 
@@ -5461,6 +6364,9 @@ class AgentService:
         self,
         conversation_id: str,
         arguments: Dict[str, Any],
+        *,
+        allow_non_h264: bool = False,
+        target_override: str = "",
     ) -> Dict[str, Any]:
         """Download a YouTube video with the local yt-dlp/ffmpeg toolchain."""
 
@@ -5484,13 +6390,52 @@ class AgentService:
                 raise WorkspaceError("YouTube 搜索词最多 500 个字符")
             target = "ytsearch1:" + query
 
+        if target_override.strip():
+            target = target_override.strip()
+            if not _is_youtube_url(target):
+                raise WorkspaceError("YouTube 格式探测结果不是受支持的官方链接")
+
         executable = _find_local_executable("yt-dlp")
         executable_args: List[str] = [executable] if executable else [sys.executable, "-m", "yt_dlp"]
         workspace = self.conversation_workspace(conversation_id)
         extension = _as_string(arguments.get("output_extension") or arguments.get("extension")).strip().lstrip(".")
-        format_selector = (
-            _as_string(arguments.get("format_selector") or arguments.get("format")).strip()
-            or "bv*[height<=720]+ba/b[height<=720]/b"
+        requested_format = _as_string(arguments.get("format_selector") or arguments.get("format")).strip()
+        cookie_file = self.data_dir / "youtube-cookies.txt"
+        probe = await self._yt_dlp_probe(
+            "YouTube",
+            workspace,
+            target,
+            cookie_file,
+            include_node_runtime=True,
+        )
+        if not probe.get("ok"):
+            return {
+                "ok": False,
+                "retry_safe": True,
+                "qq_side_effect": False,
+                "provider": "youtube",
+                "cookies_from_file": cookie_file.is_file(),
+                "proxy_from_windows": bool(_windows_configured_https_proxy()),
+                "error": probe.get("error", "YouTube 格式探测失败；未开始下载。"),
+                "diagnostic": probe.get("diagnostic", ""),
+                "yt_dlp_output": probe.get("yt_dlp_output", ""),
+            }
+        source_metadata = dict(probe.get("metadata") or {})
+        h264_available = bool(source_metadata.get("h264_available"))
+        audio_only = bool(arguments.get("audio_only", False))
+        resolved_target = _as_string(source_metadata.get("resolved_url")).strip()
+        if not _is_youtube_url(resolved_target):
+            resolved_target = target
+        if not audio_only and not h264_available and not allow_non_h264:
+            return self._create_video_download_confirmation(
+                conversation_id,
+                "youtube",
+                arguments,
+                resolved_target,
+                source_metadata,
+            )
+        format_selector = requested_format or (
+            DEFAULT_H264_FORMAT_SELECTOR if h264_available else DEFAULT_FALLBACK_FORMAT_SELECTOR
         )
         requested_filename = _as_string(arguments.get("filename")).strip()
         if requested_filename:
@@ -5499,7 +6444,7 @@ class AgentService:
             if not requested_path.suffix:
                 output_template += ".%(ext)s"
         else:
-            output_template = str(workspace / "%(title)s.%(ext)s")
+            output_template = str(workspace / "%(title)s [%(id)s].%(ext)s")
 
         command = executable_args + _yt_dlp_js_runtime_args() + [
             "--no-playlist",
@@ -5514,6 +6459,16 @@ class AgentService:
             "title:%(title)s",
             "--print",
             "webpage_url:%(webpage_url)s",
+            "--print",
+            "after_move:video_codec:%(vcodec)s",
+            "--print",
+            "after_move:audio_codec:%(acodec)s",
+            "--print",
+            "after_move:width:%(width)s",
+            "--print",
+            "after_move:height:%(height)s",
+            "--print",
+            "after_move:ext:%(ext)s",
             "-f",
             format_selector,
         ]
@@ -5523,7 +6478,6 @@ class AgentService:
 
         # YouTube cookies are opt-in and site-specific.  Never reuse the
         # Bilibili cookie jar or a browser profile for another service.
-        cookie_file = self.data_dir / "youtube-cookies.txt"
         has_cookie_file = cookie_file.is_file()
         if has_cookie_file:
             command.extend(["--cookies", str(cookie_file)])
@@ -5539,7 +6493,6 @@ class AgentService:
         command.extend(["-o", output_template, target])
 
         await self._send_tool_activity_notice(0, conversation_id, "Builtin_youtube_download")
-        started = time.time()
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(workspace),
@@ -5571,12 +6524,6 @@ class AgentService:
             candidate = Path(line.strip().strip('"'))
             if candidate.is_file():
                 candidates.append(candidate)
-        if not candidates:
-            candidates = [
-                path
-                for path in workspace.glob("*")
-                if path.is_file() and path.stat().st_mtime >= started
-            ]
         if timed_out:
             return {
                 "ok": False,
@@ -5589,6 +6536,7 @@ class AgentService:
                 "proxy_from_windows": bool(proxy),
                 "authentication_warning": authentication_warning,
                 "source_metadata": result_metadata,
+                "probe_metadata": source_metadata,
                 "error": "yt-dlp 下载超过 600 秒，已终止子进程；请检查 YouTube 链接/搜索词、网络或 cookie。",
             }
         if process.returncode != 0 or not candidates:
@@ -5610,6 +6558,7 @@ class AgentService:
                 "proxy_from_windows": bool(proxy),
                 "authentication_warning": authentication_warning,
                 "source_metadata": result_metadata,
+                "probe_metadata": source_metadata,
                 "error": error,
             }
 
@@ -5626,6 +6575,60 @@ class AgentService:
             relative_path = path.resolve().relative_to(workspace.resolve()).as_posix()
         except ValueError as exc:
             raise WorkspaceError("yt-dlp 输出文件不在当前会话工作区内，已拒绝接收") from exc
+
+        actual_metadata = dict(source_metadata)
+        actual_metadata.update(_yt_dlp_result_metadata(output))
+        local_metadata = await self._probe_media_file(path) if is_video else {}
+        local_streams = local_metadata.get("streams") if isinstance(local_metadata, Mapping) else []
+        has_video_stream = isinstance(local_streams, list) and any(
+            isinstance(item, Mapping) and _as_string(item.get("codec_type")).casefold() == "video"
+            for item in local_streams
+        )
+        if is_video and (local_metadata.get("_probe_ok") is not True or not has_video_stream):
+            probe_error = _as_string(local_metadata.get("_probe_error")) or "没有检测到视频流"
+            path.unlink(missing_ok=True)
+            return {
+                "ok": False,
+                "retry_safe": True,
+                "qq_side_effect": False,
+                "provider": "youtube",
+                "probe_metadata": {"_probe_error": probe_error},
+                "error": "下载文件未通过 ffprobe 严格验证，已删除未验证文件：" + probe_error,
+            }
+        _copy_ok, _audio_only, local_compatibility = self._qq_video_compatibility(
+            local_metadata, path
+        )
+        if local_compatibility.get("video_codec"):
+            actual_metadata.update(
+                {
+                    "video_codec": local_compatibility.get("video_codec", ""),
+                    "audio_codec": local_compatibility.get("audio_codec", ""),
+                    "width": local_compatibility.get("width", 0),
+                    "height": local_compatibility.get("height", 0),
+                    "container": local_compatibility.get("format", ""),
+                }
+            )
+        codec_value = _as_string(actual_metadata.get("video_codec")).strip()
+        if is_video and not codec_value:
+            path.unlink(missing_ok=True)
+            return {
+                "ok": False,
+                "retry_safe": True,
+                "qq_side_effect": False,
+                "provider": "youtube",
+                "probe_metadata": {"_probe_error": "ffprobe 未返回视频 codec_name"},
+                "error": "下载文件未通过 ffprobe 严格验证：缺少视频 codec_name，已删除未验证文件",
+            }
+        actual_h264 = not is_video or _is_h264_codec(codec_value)
+        if not actual_h264 and not allow_non_h264:
+            path.unlink(missing_ok=True)
+            return self._create_video_download_confirmation(
+                conversation_id,
+                "youtube",
+                arguments,
+                resolved_target,
+                actual_metadata,
+            )
 
         # Download tools are workspace-only.  No video/file message is sent by
         # this function; an explicit later send_group_file call is required
@@ -5648,6 +6651,12 @@ class AgentService:
             "proxy_from_windows": bool(proxy),
             "authentication_warning": authentication_warning,
             "source_metadata": result_metadata,
+            "probe_metadata": actual_metadata,
+            "h264_available": h264_available,
+            "video_codec": actual_metadata.get("video_codec", ""),
+            "audio_codec": actual_metadata.get("audio_codec", ""),
+            "format_selector": format_selector,
+            "confirmed_non_h264": bool(allow_non_h264 and not h264_available),
             "next_step": "先检查工作区文件；确认内容正确且需要发送时，再调用 send_group_file(path=该路径)。",
         }
 
@@ -5780,8 +6789,30 @@ class AgentService:
             result["error"] = _as_string(error).strip()[:4_000]
         if _as_string(job.get("project_url")).strip():
             result["project_url"] = _as_string(job.get("project_url"))[:2_000]
+        workspace_files = job.get("output_paths") if isinstance(job.get("output_paths"), list) else []
+        safe_workspace_files = []
+        for value in workspace_files:
+            relative = _as_string(value).strip().replace("\\", "/")
+            if not relative or relative.startswith("/") or ".." in relative.split("/"):
+                continue
+            safe_workspace_files.append(relative[:500])
+        if safe_workspace_files:
+            result["workspace_files"] = safe_workspace_files[:4]
         result["result_ready"] = result["status"] == "completed"
+        browser_state = job.get("browser_state")
+        if isinstance(browser_state, dict):
+            result.update({key: browser_state[key] for key in (
+                "stage", "browser_task", "review_task", "progress_observed", "last_observation", "recent_actions"
+            ) if key in browser_state})
         return result
+
+    @staticmethod
+    def _flow_browser_state(upstream: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep real browser evidence in the scoped job; screenshots stay local."""
+        return {key: upstream[key] for key in (
+            "stage", "browser_task", "review_task", "progress_observed", "last_observation", "recent_actions",
+            "submission_confirmed", "submission_unknown", "runtime", "ai_browser_control",
+        ) if key in upstream}
 
     @staticmethod
     def _flow_video_error_result(exc: BaseException, *, retry_safe: bool = False) -> Dict[str, Any]:
@@ -6006,7 +7037,7 @@ class AgentService:
         if inserted is None:
             return
         group = self.db.get_group(conversation_id)
-        if group and group.get("enabled"):
+        if group and self._conversation_enabled_for_runtime(group):
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
@@ -6026,6 +7057,19 @@ class AgentService:
 
         if not self._is_retryable_flow_timeout(error):
             return None, ""
+        browser_state = job.get("browser_state")
+        browser_state = browser_state if isinstance(browser_state, dict) else {}
+        # A confirmed AI browser job owns a cloud render. A timeout only ends
+        # observation; it never proves the render stopped. Ambiguous submits
+        # similarly cannot authorize a second charged generation.
+        if (
+            job.get("submission_confirmed") or job.get("submission_unknown")
+            or browser_state.get("submission_confirmed") or browser_state.get("submission_unknown")
+            or browser_state.get("browser_task") or browser_state.get("review_task")
+            or browser_state.get("runtime") == "qqbot-ai-browser"
+            or browser_state.get("ai_browser_control") is True
+        ):
+            return None, ""
         retry_count = max(0, int(job.get("retry_count") or 0))
         if retry_count >= FLOW_VIDEO_AUTO_RETRY_LIMIT:
             return None, ""
@@ -6044,7 +7088,19 @@ class AgentService:
             "outputs": max(1, int(job.get("outputs") or 1)),
         }
         try:
-            upstream = await self._flow_video_client().create(**arguments)
+            flow_client = self._flow_video_client()
+            health = await flow_client.health()
+            if (
+                health.get("runtime") != "qqbot-ai-browser"
+                or health.get("ai_browser_control") is not True
+                or health.get("submission_confirmation") != "flow_page_dom"
+            ):
+                raise FlowVideoError("Flow 自动重试未启用 AI 浏览器任务服务；未再次提交", code="submission_confirmation_unsupported")
+            upstream = await flow_client.create(
+                **arguments, workspace_dir=str(self.conversation_workspace(conversation_id))
+            )
+            if upstream.get("submission_confirmed") is not True:
+                raise FlowVideoError("Flow 自动重试未确认页面真实启动；未报告重试成功", code="submission_confirmation_missing")
             new_job_id = _as_string(upstream.get("id")).strip()
             if not new_job_id:
                 raise FlowVideoError("Flow 自动重试未返回任务 ID")
@@ -6087,6 +7143,9 @@ class AgentService:
                     else _as_string(upstream.get("error"))
                 ),
             )
+            replacement = self.db.update_flow_video_job(
+                conversation_id, new_job_id, browser_state=self._flow_browser_state(upstream)
+            ) or replacement
             return replacement, ""
         except Exception as exc:
             return None, redact_error_detail(exc, limit=2_000) or "自动重试提交失败"
@@ -6287,15 +7346,14 @@ class AgentService:
         current = self.db.get_flow_video_job(conversation_id, job_id) or job
         status = _as_string(current.get("status")).lower()
         if status in FLOW_VIDEO_TERMINAL_STATUSES:
-            if status == "completed" and current.get("delivery_status") in {"pending", "sending"}:
+            if status == "completed" and current.get("delivery_status") in {"pending", "sending", "downloading"}:
                 if self.settings.flow_video_auto_send:
                     await self._deliver_flow_video_job(current, notify_failure=notify_failure)
                 else:
-                    self.db.update_flow_video_job(
-                        conversation_id,
-                        job_id,
-                        delivery_status="ready",
-                        error="",
+                    await self._deliver_flow_video_job(
+                        current,
+                        send_to_qq=False,
+                        notify_failure=notify_failure,
                     )
                 return self.db.get_flow_video_job(conversation_id, job_id) or current
             return current
@@ -6350,6 +7408,7 @@ class AgentService:
             started_at=_as_string(upstream.get("started_at") or current.get("started_at")),
             completed_at=_as_string(upstream.get("completed_at") or current.get("completed_at")),
             project_url=_as_string(upstream.get("project_url") or current.get("project_url")),
+            browser_state=self._flow_browser_state(upstream),
             error=(json.dumps(upstream.get("error"), ensure_ascii=False) if isinstance(upstream.get("error"), dict) else _as_string(upstream.get("error"))),
             last_poll_at=datetime.now(timezone.utc).isoformat(),
             poll_failures=0,
@@ -6365,15 +7424,14 @@ class AgentService:
                 error_text,
                 notify=notify_failure,
             )
-        if upstream_status == "completed" and updated.get("delivery_status") in {"pending", "sending"}:
+        if upstream_status == "completed" and updated.get("delivery_status") in {"pending", "sending", "downloading"}:
             if self.settings.flow_video_auto_send:
                 await self._deliver_flow_video_job(updated, notify_failure=notify_failure)
             else:
-                self.db.update_flow_video_job(
-                    conversation_id,
-                    job_id,
-                    delivery_status="ready",
-                    error="",
+                await self._deliver_flow_video_job(
+                    updated,
+                    send_to_qq=False,
+                    notify_failure=notify_failure,
                 )
             return self.db.get_flow_video_job(conversation_id, job_id) or updated
         return updated
@@ -6383,9 +7441,10 @@ class AgentService:
         job: Dict[str, Any],
         *,
         force: bool = False,
+        send_to_qq: bool = True,
         notify_failure: bool = True,
     ) -> Dict[str, Any]:
-        """Download, QQ-transcode and send every completed Flow output once."""
+        """Download completed Flow outputs to the conversation workspace, then optionally send."""
 
         conversation_id = _as_string(job.get("conversation_id"))
         job_id = _as_string(job.get("job_id"))
@@ -6399,6 +7458,8 @@ class AgentService:
             delivery_status = _as_string(current.get("delivery_status")) or "pending"
             if delivery_status == "sent" and not force:
                 return {"ok": True, "already_sent": True, **self._flow_video_public_job(current)}
+            if delivery_status == "ready" and not send_to_qq:
+                return {"ok": True, "already_downloaded": True, **self._flow_video_public_job(current)}
             if delivery_status == "unknown":
                 return {
                     "ok": False,
@@ -6408,20 +7469,10 @@ class AgentService:
                 }
             if delivery_status == "failed" and not force:
                 return {"ok": False, "error": _as_string(current.get("error")) or "视频发送失败，未自动重试"}
-            if not self.adapter or not self.adapter.connected:
-                error = "OneBot 未连接，视频已生成但暂不能发送"
-                self.db.update_flow_video_job(
-                    conversation_id,
-                    job_id,
-                    delivery_status="pending",
-                    error=error,
-                )
-                return {"ok": False, "retry_pending": True, "error": error}
-
             current = self.db.update_flow_video_job(
                 conversation_id,
                 job_id,
-                delivery_status="sending",
+                delivery_status="sending" if send_to_qq else "downloading",
                 error="",
             ) or current
             output_count = max(1, min(4, int(current.get("outputs") or 1)))
@@ -6453,7 +7504,9 @@ class AgentService:
                             job_id,
                             output_paths=local_paths,
                         )
-                    if len(sent_ids) >= index:
+                    if not send_to_qq or len(sent_ids) >= index:
+                        continue
+                    if not self.adapter or not self.adapter.connected:
                         continue
                     if turn_id == 0:
                         turn_id = self.db.create_turn(conversation_id, [])
@@ -6492,17 +7545,13 @@ class AgentService:
                                 "error": unknown_detail,
                             }
                         if "OneBot 未连接" in detail:
-                            # No remote request happened; keep the completed
-                            # job pending for the next reconnect.
-                            self.db.update_flow_video_job(
-                                conversation_id,
-                                job_id,
-                                delivery_status="pending",
-                                error=detail,
-                            )
+                            # No remote request happened. Keep downloading any
+                            # remaining outputs; the next monitor pass can
+                            # retry delivery from the saved workspace files.
                             if turn_id:
                                 self.db.finish_turn(turn_id, "cancelled", error=detail)
-                            return {"ok": False, "retry_pending": True, "error": detail}
+                                turn_id = 0
+                            continue
                         raise FlowVideoError(detail)
                     message_id = _as_string(sent.get("message_id"))
                     if message_id:
@@ -6521,10 +7570,33 @@ class AgentService:
                         delivery_message_ids=sent_ids,
                         output_paths=local_paths,
                     )
+                if send_to_qq and (
+                    not self.adapter
+                    or not self.adapter.connected
+                    or len(sent_ids) < output_count
+                ):
+                    error = "视频已下载到会话工作区；QQ 发送未全部完成，稍后再自动发送"
+                    self.db.update_flow_video_job(
+                        conversation_id,
+                        job_id,
+                        delivery_status="pending",
+                        delivery_message_ids=sent_ids,
+                        output_paths=local_paths,
+                        error=error,
+                    )
+                    if turn_id:
+                        self.db.finish_turn(turn_id, "cancelled", error=error)
+                    return {
+                        "ok": False,
+                        "retry_pending": True,
+                        "workspace_downloaded": True,
+                        "workspace_files": local_paths,
+                        "error": error,
+                    }
                 self.db.update_flow_video_job(
                     conversation_id,
                     job_id,
-                    delivery_status="sent",
+                    delivery_status="sent" if send_to_qq else "ready",
                     delivery_message_ids=sent_ids,
                     output_paths=local_paths,
                     error="",
@@ -6533,7 +7605,9 @@ class AgentService:
                     self.db.finish_turn(turn_id, "completed", "Google Flow 视频已自动发送")
                 return {
                     "ok": True,
-                    "sent": True,
+                    "sent": send_to_qq,
+                    "downloaded": True,
+                    "workspace_files": local_paths,
                     "message_ids": sent_ids,
                     "output_count": output_count,
                     "delivery": "video_card",
@@ -6610,14 +7684,14 @@ class AgentService:
                     group = self.db.get_group(_as_string(job.get("conversation_id")))
                     # Disabling a conversation stops new collection and does
                     # not upload/send its existing task until re-enabled.
-                    if not group or not group.get("enabled"):
+                    if not group or not self._conversation_enabled_for_runtime(group):
                         continue
                     await self._refresh_flow_video_job(job)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Flow video monitor poll failed")
-            await asyncio.sleep(max(2, min(60, int(self.settings.flow_video_poll_seconds or 5))))
+            await asyncio.sleep(max(2, min(60, int(self.settings.flow_video_poll_seconds or 6))))
 
     async def _execute_flow_video_tool(
         self,
@@ -6795,10 +7869,26 @@ class AgentService:
             normalized_arguments["max_credits"] = max_credits
         status_value = "failed"
         try:
-            upstream = await self._flow_video_client().create(**normalized_arguments)
+            flow_client = self._flow_video_client()
+            flow_health = await flow_client.health()
+            if flow_health.get("submission_confirmation") != "flow_page_dom" or flow_health.get("ai_browser_control") is not True:
+                raise FlowVideoError(
+                    "当前 Flow 服务没有启用 AI 浏览器子任务；本次未提交视频。请通过更新后的启动脚本加载 QQBot AI Flow 服务。",
+                    status_code=409,
+                    code="submission_confirmation_unsupported",
+                )
+            upstream = await flow_client.create(
+                **normalized_arguments, workspace_dir=str(self.conversation_workspace(conversation_id))
+            )
             job_id = _as_string(upstream.get("id")).strip()
             if not job_id:
                 raise FlowVideoError("Flow API 接受请求但没有返回任务 ID")
+            if upstream.get("submission_confirmed") is not True:
+                raise FlowVideoError(
+                    "Flow API 未返回 Flow 页面已接受任务的确认；未向会话报告任务已启动。",
+                    status_code=502,
+                    code="submission_confirmation_missing",
+                )
             seconds_result = upstream.get("seconds", seconds)
             try:
                 seconds_result = int(seconds_result)
@@ -6820,6 +7910,9 @@ class AgentService:
                 project_url=_as_string(upstream.get("project_url")),
                 error=(json.dumps(upstream.get("error"), ensure_ascii=False) if isinstance(upstream.get("error"), dict) else _as_string(upstream.get("error"))),
             )
+            created = self.db.update_flow_video_job(
+                conversation_id, job_id, browser_state=self._flow_browser_state(upstream)
+            ) or created
             notice = await self._send_flow_video_acceptance_notice(
                 turn_id,
                 conversation_id,
@@ -6888,10 +7981,17 @@ class AgentService:
         app_sent_metadata: Optional[Dict[str, Any]] = None,
         allow_user_facing_group_summary: bool = False,
         rolling_summary_candidates: Optional[Sequence[str]] = None,
+        actor_id: str = "",
     ) -> Dict[str, Any]:
         existing = self.db.get_tool_audit(turn_id, tool_call_id)
         if existing:
             return json_loads(existing.get("result_json"), {"ok": False, "error": "tool audit malformed"})
+        try:
+            tool_name, arguments = normalise_call(tool_name, arguments, TOOLS)
+        except ValueError as exc:
+            result = {"ok": False, "retry_safe": True, "error": str(exc)}
+            self.db.add_tool_audit(turn_id, group_id, tool_call_id, tool_name, arguments, result, "failed")
+            return result
         private_summary_candidates = list(rolling_summary_candidates or self._rolling_summary_candidates(group_id))
 
         def is_private_rolling_summary(value: str) -> bool:
@@ -6906,6 +8006,7 @@ class AgentService:
         # live OneBot connection and must not enter the state-changing QQ
         # operation reservation path below.
         if tool_name in {
+            "Builtin_settings",
             "Builtin_Websearch",
             "Builtin_querymessage",
             "Builtin_querymemory",
@@ -6966,6 +8067,7 @@ class AgentService:
         workspace_download_tool = tool_name in {
             "Builtin_bilibili_download",
             "Builtin_youtube_download",
+            "Builtin_video_download_confirmation",
         }
         if not workspace_download_tool and (not self.adapter or not self.adapter.connected):
             result = {"ok": False, "error": "OneBot 未连接"}
@@ -7093,6 +8195,19 @@ class AgentService:
                         )
                 elif len(query) > MAX_YOUTUBE_QUERY_CHARS:
                     raise ValueError("YouTube 搜索词最多 500 个字符")
+            elif tool_name == "Builtin_video_download_confirmation":
+                unknown = set(arguments).difference({"confirmation_id", "decision"})
+                if unknown:
+                    raise ValueError(
+                        "Builtin_video_download_confirmation 包含不允许的参数："
+                        + ", ".join(sorted(unknown))
+                    )
+                confirmation_id = _as_string(arguments.get("confirmation_id")).strip()
+                decision = _as_string(arguments.get("decision")).strip().lower()
+                if not confirmation_id or len(confirmation_id) > 160:
+                    raise ValueError("confirmation_id 不能为空且格式无效")
+                if decision not in {"approve", "decline", "unclear"}:
+                    raise ValueError("decision 必须是 approve、decline 或 unclear")
             elif tool_name == "Builtin_music_download":
                 unknown = set(arguments).difference(MUSIC_DOWNLOAD_ARGUMENTS)
                 if unknown:
@@ -7451,6 +8566,14 @@ class AgentService:
                 )
                 status = "success" if result.get("ok") is True else "failed"
 
+            elif tool_name == "Builtin_video_download_confirmation":
+                result = await self._confirm_video_download(
+                    group_id,
+                    effective_arguments,
+                    actor_id=actor_id,
+                )
+                status = "success" if result.get("ok") is True else "failed"
+
             elif tool_name == "Builtin_bilibili_download":
                 result = await self._bilibili_download(group_id, effective_arguments)
                 if result.get("ok") is not True:
@@ -7539,6 +8662,22 @@ class AgentService:
                 "error": "工具参数必须是 JSON 对象；未执行。",
             }
         try:
+            if tool_name == "Builtin_settings":
+                if arguments:
+                    raise ValueError("Builtin_settings 不接受参数，只能读取自己的介绍文档")
+                document = Path(__file__).with_name("assistant_introduction.md")
+                text = document.read_text(encoding="utf-8").strip()
+                if not text:
+                    raise ValueError("介绍文档为空")
+                return {
+                    "ok": True,
+                    "document_id": "assistant_introduction",
+                    "title": "AI 助手介绍",
+                    "format": "markdown",
+                    "text": text,
+                    "read_only": True,
+                    "untrusted_data": True,
+                }
             if tool_name == "Builtin_Websearch":
                 unknown = set(arguments).difference({"query", "max_results"})
                 if unknown:
@@ -7697,6 +8836,7 @@ class AgentService:
         return {
             "onebot_connected": self.onebot_connected,
             "enabled_group_count": self.db.enabled_group_count(),
+            "auto_monitor_all_conversations": self._auto_monitor_all_conversations,
             "pending_event_count": self.db.pending_event_count(),
             "flow_video_pending_count": len(self.db.pending_flow_video_jobs(limit=1_000)),
             "media_usage_bytes": usage,

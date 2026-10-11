@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +110,43 @@ class DownloadedVideoProcess:
         return (str(self.path).encode("utf-8"), b"")
 
 
+class ProbeVideoProcess:
+    returncode = 0
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return (
+            json.dumps(
+                {
+                    "title": "test",
+                    "webpage_url": "https://www.bilibili.com/video/BV1xx411c7mD",
+                    "formats": [
+                        {
+                            "format_id": "80",
+                            "vcodec": "avc1.64001f",
+                            "acodec": "mp4a.40.2",
+                            "height": 360,
+                            "width": 640,
+                            "ext": "mp4",
+                            "tbr": 500,
+                        }
+                    ],
+                }
+            ).encode("utf-8"),
+            b"",
+        )
+
+
+async def valid_media_probe(path: Path) -> dict[str, Any]:
+    return {
+        "_probe_ok": True,
+        "streams": [
+            {"codec_type": "video", "codec_name": "h264", "codec_tag_string": "avc1", "profile": "Main", "level": 31, "width": 640, "height": 360, "pix_fmt": "yuv420p"},
+            {"codec_type": "audio", "codec_name": "aac", "channels": 2},
+        ],
+        "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+    }
+
+
 @pytest.mark.asyncio
 async def test_bilibili_download_stores_mp4_without_qq_send(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     workspace_root = tmp_path / "Workspace"
@@ -121,10 +159,13 @@ async def test_bilibili_download_stores_mp4_without_qq_send(tmp_path: Path, monk
     service.adapter = adapter  # type: ignore[assignment]
 
     async def fake_create(*_: object, **__: object) -> DownloadedVideoProcess:
+        if "--dump-single-json" in list(_):
+            return ProbeVideoProcess()  # type: ignore[return-value]
         return DownloadedVideoProcess(video)
 
     monkeypatch.setattr("app.service.asyncio.create_subprocess_exec", fake_create)
     monkeypatch.setattr("app.service._windows_configured_https_proxy", lambda: "")
+    monkeypatch.setattr(service, "_probe_media_file", valid_media_probe)
     try:
         result = await service._bilibili_download(
             "123", {"url": "https://www.bilibili.com/video/BV1xx411c7mD"}
@@ -166,6 +207,8 @@ async def test_bilibili_download_keeps_original_container_until_explicit_send(
     service.adapter = adapter  # type: ignore[assignment]
 
     async def fake_create(*_: object, **__: object) -> DownloadedVideoProcess:
+        if "--dump-single-json" in list(_):
+            return ProbeVideoProcess()  # type: ignore[return-value]
         return DownloadedVideoProcess(source)
 
     async def fail_if_transcoded(path: Path) -> Path:
@@ -174,6 +217,7 @@ async def test_bilibili_download_keeps_original_container_until_explicit_send(
     monkeypatch.setattr("app.service.asyncio.create_subprocess_exec", fake_create)
     monkeypatch.setattr(service, "_transcode_video_for_qq", fail_if_transcoded)
     monkeypatch.setattr("app.service._windows_configured_https_proxy", lambda: "")
+    monkeypatch.setattr(service, "_probe_media_file", valid_media_probe)
     try:
         result = await service._bilibili_download(
             "123", {"url": "https://www.bilibili.com/video/BV1xx411c7mD"}
@@ -207,10 +251,13 @@ async def test_bilibili_audio_only_stays_in_workspace(
     service.adapter = adapter  # type: ignore[assignment]
 
     async def fake_create(*_: object, **__: object) -> DownloadedVideoProcess:
+        if "--dump-single-json" in list(_):
+            return ProbeVideoProcess()  # type: ignore[return-value]
         return DownloadedVideoProcess(audio)
 
     monkeypatch.setattr("app.service.asyncio.create_subprocess_exec", fake_create)
     monkeypatch.setattr("app.service._windows_configured_https_proxy", lambda: "")
+    monkeypatch.setattr(service, "_probe_media_file", valid_media_probe)
     try:
         result = await service._bilibili_download(
             "123",

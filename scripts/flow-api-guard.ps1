@@ -3,8 +3,6 @@ param(
     [ValidateRange(1, 65535)]
     [int]$Port = 8787,
     [string]$FlowProjectDir,
-    [string]$FlowCookiesFile,
-    [string]$FlowCookiesFile2,
     [string]$DataDir,
     [ValidateRange(1, 300)]
     [int]$PollSeconds = 5,
@@ -17,19 +15,12 @@ param(
 # without restarting the QQ agent itself.
 $ErrorActionPreference = 'Stop'
 $scriptPath = $MyInvocation.MyCommand.Path
-$script:FlowSessionConfigured = $false
 
 function Import-UserFlowSessionEnvironment {
-    # A shell that was already open when the user added the second account does
-    # not automatically receive new User environment variables.  Pull only the
-    # session path variables into this process so an immediate restart works;
-    # cookie contents never pass through the command line or logs.
-    foreach ($name in @(
-        'FLOW_STORAGE_STATE', 'FLOW_STORAGE_STATE_2', 'FLOW_STORAGE_STATES',
-        'FLOW_COOKIES_FILE', 'FLOW_COOKIES_FILE_2', 'FLOW_COOKIES_FILES',
-        'FLOW_PROFILE_ROOT', 'FLOW_USER_DATA_DIR', 'FLOW_USER_DATA_DIR_2',
-        'FLOW_USER_DATA_DIRS', 'FLOW_PERSISTENT_PROFILES'
-    )) {
+    # Import profile paths only; legacy authentication exports are never used.
+    $profileNames = @('FLOW_PROFILE_ROOT', 'FLOW_USER_DATA_DIR', 'FLOW_USER_DATA_DIRS', 'FLOW_ACCOUNT_COUNT', 'FLOW_PERSISTENT_PROFILES')
+    $profileNames += (1..20 | ForEach-Object { "FLOW_USER_DATA_DIR_$_" })
+    foreach ($name in $profileNames) {
         if ([Environment]::GetEnvironmentVariable($name, 'Process')) {
             continue
         }
@@ -218,169 +209,48 @@ function Ensure-FlowProfileRoot {
     }
 }
 
-function Get-FlowCookieCandidates {
-    param([ValidateSet(1, 2)][int]$Account = 1)
-
-    $candidates = @()
-    $explicit = if ($Account -eq 1) { $FlowCookiesFile } else { $FlowCookiesFile2 }
-    $environmentName = if ($Account -eq 1) { 'FLOW_COOKIES_FILE' } else { 'FLOW_COOKIES_FILE_2' }
-    if ($explicit) {
-        $candidates += $explicit
-    }
-    $environmentValue = [Environment]::GetEnvironmentVariable($environmentName, 'Process')
-    if ($environmentValue) {
-        $candidates += $environmentValue
-    }
-    if ($env:FLOW_COOKIES_FILES) {
-        $plural = @($env:FLOW_COOKIES_FILES -split ';' | Where-Object { $_ })
-        if ($plural.Count -ge $Account) {
-            $candidates += $plural[$Account - 1]
-        }
-    }
-
-    if ($env:USERPROFILE) {
-        $downloads = Join-Path $env:USERPROFILE 'Downloads'
-        if (Test-Path -LiteralPath $downloads -PathType Container) {
-            # The Codex Google Flow skill keeps its converted cookie file
-            # here.  Also accept Netscape exports copied from Chrome.  When
-            # two exports are present, account 2 receives the newest export
-            # that is different from the source selected for account 1.
-            if ($Account -eq 1) {
-                $candidates += (Join-Path $env:USERPROFILE '.codex\skills\google-flow-video\mcp\secrets\flow-cookies.json')
-            }
-            $netscapeFiles = @(Get-ChildItem -LiteralPath $downloads -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match '(?i)^labs\.google_cookies(?: \(\d+\))?\.txt$' } |
-                Sort-Object LastWriteTimeUtc -Descending)
-            $accountOneSource = [Environment]::GetEnvironmentVariable('FLOW_COOKIES_FILE', 'Process')
-            $resolvedAccountOneSource = $accountOneSource
-            if ($accountOneSource) {
-                try { $resolvedAccountOneSource = (Resolve-Path -LiteralPath $accountOneSource -ErrorAction Stop).Path } catch {}
-            }
-            foreach ($file in $netscapeFiles) {
-                if ($Account -eq 2 -and $resolvedAccountOneSource -and
-                    $resolvedAccountOneSource -eq $file.FullName) {
-                    continue
-                }
-                $candidates += $file.FullName
-            }
-            if ($Account -eq 2) {
-                # Keep the historical JSON fallback for users who explicitly
-                # exported a Playwright/extension cookie file rather than a
-                # Netscape file.
-                Get-ChildItem -LiteralPath $downloads -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -match '(?i)^(?:cookies|flow-cookies)(?: \(\d+\))?\.json$' } |
-                    Sort-Object LastWriteTimeUtc -Descending |
-                    ForEach-Object { $candidates += $_.FullName }
-            }
-        }
-    }
-
-    if ($Account -eq 1) {
-        $project = Get-FlowProject
-        if ($project) {
-            $candidates += (Join-Path $project 'secrets\flow-cookies.json')
-        }
-    }
-    return @($candidates | Where-Object { $_ } | Select-Object -Unique)
-}
-
-function Ensure-FlowSessionSource {
-    param([ValidateSet(1, 2)][int]$Account)
-
-    $storageName = if ($Account -eq 1) { 'FLOW_STORAGE_STATE' } else { 'FLOW_STORAGE_STATE_2' }
-    $cookieName = if ($Account -eq 1) { 'FLOW_COOKIES_FILE' } else { 'FLOW_COOKIES_FILE_2' }
-    $storage = [Environment]::GetEnvironmentVariable($storageName, 'Process')
-    if ($storage) {
-        if (Test-Path -LiteralPath $storage -PathType Leaf) {
-            Write-FlowLog "Google Flow 账号 $Account 使用 storage-state 会话。" ([ConsoleColor]::Green)
-            return $true
-        }
-        Write-FlowLog "账号 $Account 的 $storageName 文件不存在；尝试 Cookie 会话。" ([ConsoleColor]::Yellow)
-        [Environment]::SetEnvironmentVariable($storageName, $null, 'Process')
-    }
-
-    $source = $null
-    foreach ($candidate in (Get-FlowCookieCandidates -Account $Account)) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            $source = (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path
-            break
-        }
-    }
-    if (-not $source) {
-        return $false
-    }
-
-    $extension = [IO.Path]::GetExtension($source).ToLowerInvariant()
-    if ($extension -eq '.json') {
-        [Environment]::SetEnvironmentVariable($cookieName, $source, 'Process')
-        Write-FlowLog "已发现 Google Flow 账号 $Account 的 Cookie 配置。" ([ConsoleColor]::Green)
-        return $true
-    }
-
-    if ($extension -ne '.txt') {
-        Write-FlowLog "账号 $Account 的 Flow Cookie 文件格式不受支持；请使用 JSON 或 Netscape .txt。" ([ConsoleColor]::Yellow)
-        return $false
-    }
-
-    $project = Get-FlowProject
-    $node = Get-NodePath
-    $converter = if ($project) { Join-Path $project 'scripts\import-netscape-cookies.mjs' } else { $null }
-    if (-not $node -or -not $converter -or -not (Test-Path -LiteralPath $converter -PathType Leaf)) {
-        Write-FlowLog "账号 $Account 找到 Netscape Cookie，但缺少 Node.js 或转换脚本；守护会继续重试。" ([ConsoleColor]::Yellow)
-        return $false
-    }
-
-    $sessionDirectory = Get-SessionDataDirectory
-    if (-not $sessionDirectory) {
-        Write-FlowLog '无法创建 Flow Cookie 输出目录；请检查 QQ_AI_DATA_DIR。' ([ConsoleColor]::Yellow)
-        return $false
-    }
-    $suffix = if ($Account -eq 1) { '' } else { '-2' }
-    $destination = Join-Path $sessionDirectory "flow-cookies$suffix.json"
-    $needsConversion = $true
-    try {
-        $destinationItem = Get-Item -LiteralPath $destination -ErrorAction Stop
-        $sourceItem = Get-Item -LiteralPath $source -ErrorAction Stop
-        $needsConversion = $sourceItem.LastWriteTimeUtc -gt $destinationItem.LastWriteTimeUtc -or $destinationItem.Length -lt 20
-    } catch {
-        $needsConversion = $true
-    }
-
-    if ($needsConversion) {
-        try {
-            & $node $converter $source $destination
-            if ($LASTEXITCODE -ne 0) {
-                throw "converter exit code $LASTEXITCODE"
-            }
-        } catch {
-            Write-FlowLog "账号 $Account Netscape Cookie 转换失败：$($_.Exception.Message)" ([ConsoleColor]::Red)
-            return $false
-        }
-    }
-
-    [Environment]::SetEnvironmentVariable($cookieName, $destination, 'Process')
-    Write-FlowLog "已将账号 $Account 的 Netscape Cookie 转换为本地配置。" ([ConsoleColor]::Green)
-    return $true
-}
-
 function Ensure-FlowSession {
     Import-UserFlowSessionEnvironment
-    if ($script:FlowSessionConfigured) {
-        return $true
+    # Only clear child-process configuration. Never delete old exports or the
+    # authentication already stored in the persistent browser directories.
+    foreach ($name in @(
+        'FLOW_STORAGE_STATE', 'FLOW_STORAGE_STATE_1', 'FLOW_STORAGE_STATE_2', 'FLOW_STORAGE_STATES',
+        'FLOW_COOKIES_FILE', 'FLOW_COOKIES_FILE_1', 'FLOW_COOKIES_FILE_2', 'FLOW_COOKIES_FILES'
+    )) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+    $env:FLOW_PERSISTENT_PROFILES = '1'
+    if (-not (Ensure-FlowProfileRoot)) { return $false }
+    $listed = @($env:FLOW_USER_DATA_DIRS -split '[;\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $accountCount = 2
+    if ($env:FLOW_ACCOUNT_COUNT) {
+        if ($env:FLOW_ACCOUNT_COUNT -notmatch '^\d+$') { throw 'FLOW_ACCOUNT_COUNT 必须是 1 到 20 的整数' }
+        $accountCount = [int]$env:FLOW_ACCOUNT_COUNT
+        if ($accountCount -lt 1 -or $accountCount -gt 20) { throw 'FLOW_ACCOUNT_COUNT 必须是 1 到 20 的整数' }
     }
-
-    $configured = 0
-    foreach ($account in 1, 2) {
-        if (Ensure-FlowSessionSource -Account $account) {
-            $configured++
+    foreach ($entry in (Get-ChildItem Env:)) {
+        if ($entry.Name -match '^FLOW_USER_DATA_DIR_(\d+)$' -and $entry.Value) {
+            $accountCount = [Math]::Max($accountCount, [int]$Matches[1])
         }
     }
-    if ($configured -gt 0) {
-        $script:FlowSessionConfigured = $true
-        Write-FlowLog "已配置 $configured 个 Google Flow 会话账号；生成失败时最多轮换尝试 3 次。" ([ConsoleColor]::Green)
-        return $true
+    $accountCount = [Math]::Max($accountCount, $listed.Count)
+    if ($accountCount -gt 20) { throw 'Flow 持久浏览器资料最多支持 20 个账号' }
+    $profileDirs = @()
+    for ($index = 1; $index -le $accountCount; $index++) {
+        $name = if ($index -eq 1) { 'FLOW_USER_DATA_DIR' } else { "FLOW_USER_DATA_DIR_$index" }
+        $directory = [Environment]::GetEnvironmentVariable($name, 'Process')
+        if (-not $directory -and $index -eq 1) { $directory = $env:FLOW_USER_DATA_DIR_1 }
+        if (-not $directory -and $listed.Count -ge $index) { $directory = $listed[$index - 1] }
+        if (-not $directory) { $directory = Join-Path $env:FLOW_PROFILE_ROOT "account-$index" }
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        $resolvedDirectory = (Resolve-Path -LiteralPath $directory -ErrorAction Stop).Path
+        if ($profileDirs -contains $resolvedDirectory) { throw '每个 Flow 账号必须使用不同的持久浏览器资料目录' }
+        $profileDirs += $resolvedDirectory
+        [Environment]::SetEnvironmentVariable($name, $resolvedDirectory, 'Process')
     }
-    return $false
+    $env:FLOW_USER_DATA_DIR_1 = $null
+    $env:FLOW_USER_DATA_DIRS = $profileDirs -join ';'
+    $env:FLOW_ACCOUNT_COUNT = "$accountCount"
+    Write-FlowLog "Flow 仅使用 $accountCount 个账号的独立持久浏览器资料；不读取或导入 Cookie/storage-state 文件。" ([ConsoleColor]::Green)
+    return $true
 }
 
 function Get-FlowHeaders {
@@ -414,30 +284,90 @@ function Get-FlowHealth {
 
 function Test-FlowHealth {
     $response = Get-FlowHealth
-    return ($response -and $response.ok -eq $true)
+    return ($response -and $response.ok -eq $true -and
+        $response.runtime -eq 'qqbot-ai-browser' -and
+        [int]$response.runtime_version -ge 5 -and
+        $response.browser_resources.limit -eq 1 -and
+        $response.browser_resources.lazy_start -eq $true -and
+        $response.browser_resources.release_after_task -eq $true -and
+        $response.authentication_mode -eq 'persistent_browser_profile' -and
+        $response.cookie_import_enabled -eq $false -and
+        $response.storage_state_import_enabled -eq $false -and
+        $response.ai_browser_control -eq $true -and
+        $response.submission_confirmation -eq 'flow_page_dom')
 }
 
-function Test-FlowReadiness {
-    $response = Get-FlowHealth -Deep -TimeoutSeconds 90
-    if (-not $response -or $response.generation_ready -ne $true) {
-        $details = @()
-        if ($response -and $response.accounts) {
-            $details = @($response.accounts | ForEach-Object {
-                if ($_.error) { "账号 $($_.account)：$($_.error)" }
-            } | Where-Object { $_ })
-        }
-        $suffix = if ($details.Count) { ' ' + ($details -join ' | ') } else { ' 请查看 flow-api.stderr.log 中的账号诊断。' }
-        Write-FlowLog ("Flow API 进程已启动，但严格可用性检测失败。" + $suffix) ([ConsoleColor]::Red)
+function Remove-IdleLegacyFlowApi {
+    param($Health)
+
+    # Upgrade only a positively identified legacy companion or this checkout's
+    # outdated AI runtime. Unknown listeners and busy/unobservable jobs stay live.
+    if (-not $Health -or $Health.ok -ne $true -or
+        ($Health.runtime -eq 'qqbot-ai-browser' -and [int]$Health.runtime_version -ge 5)) {
         return $false
     }
-    $usable = [int]$response.usable_account_count
-    $total = [int]$response.session_account_count
-    if ($response.full_concurrency_ready -eq $true) {
-        Write-FlowLog "严格检测通过：$usable/$total 个账号可用，可并行生成；单任务等待上限 20 分钟。" ([ConsoleColor]::Green)
-    } else {
-        Write-FlowLog "严格检测部分通过：$usable/$total 个账号可用；当前只能按可用账号数量并行。" ([ConsoleColor]::Yellow)
+    try {
+        if (-not $Health.pool -or $null -eq $Health.pool.busy_workers -or
+            $null -eq $Health.pool.queued_attempts -or
+            [int]$Health.pool.busy_workers -gt 0 -or [int]$Health.pool.queued_attempts -gt 0) {
+            Write-FlowLog '旧 Flow 服务仍有任务或无法确认空闲，暂不迁移；等待任务结束后守护会重试。' ([ConsoleColor]::Yellow)
+            return $false
+        }
+        if ($Health.runtime -eq 'qqbot-ai-browser' -and
+            (-not $Health.browser_resources -or $null -eq $Health.browser_resources.active -or
+             $null -eq $Health.browser_resources.queued -or [int]$Health.browser_resources.active -gt 0 -or
+             [int]$Health.browser_resources.queued -gt 0)) {
+            Write-FlowLog 'Flow 浏览器仍在使用或无法确认已释放，等待任务结束后再升级。' ([ConsoleColor]::Yellow)
+            return $false
+        }
+        $videos = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/v1/videos?limit=100" -Headers (Get-FlowHeaders) -TimeoutSec 3 -ErrorAction Stop
+        if ($null -eq $videos.data -or @($videos.data | Where-Object { $_.status -in @('queued', 'in_progress') }).Count) {
+            Write-FlowLog '旧 Flow 服务有未完成任务或任务状态无法核实，暂不迁移。' ([ConsoleColor]::Yellow)
+            return $false
+        }
+        $owners = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $Port -State Listen -ErrorAction Stop |
+            Select-Object -ExpandProperty OwningProcess -Unique)
+        if ($owners.Count -ne 1) { throw '无法唯一确认旧 Flow 监听进程' }
+        $legacyProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($owners[0])" -ErrorAction Stop
+        $knownLegacy = $Health.runtime -ne 'qqbot-ai-browser' -and
+            $legacyProcess.CommandLine -match '(?i)(?:^|[\s"\\/])src[\\/]api-server\.js(?:[\s"]|$)'
+        $knownAi = $false
+        if ($Health.runtime -eq 'qqbot-ai-browser' -and $scriptPath) {
+            $taskAiEntry = Join-Path (Split-Path -Parent (Split-Path -Parent $scriptPath)) 'scripts\flow-ai\api.mjs'
+            $knownAi = $legacyProcess.CommandLine -match ('(?i)(?:^|[\s"])' + [regex]::Escape($taskAiEntry) + '(?:[\s"]|$)')
+        }
+        if ($legacyProcess.Name -notmatch '^node(?:\.exe)?$' -or -not ($knownLegacy -or $knownAi)) {
+            throw '监听进程不是已识别的旧 Flow Node 服务'
+        }
+        $latest = Get-FlowHealth
+        if (-not $latest -or $latest.ok -ne $true -or $latest.runtime -ne $Health.runtime -or
+            -not $latest.pool -or $null -eq $latest.pool.busy_workers -or
+            $null -eq $latest.pool.queued_attempts -or [int]$latest.pool.busy_workers -gt 0 -or
+            [int]$latest.pool.queued_attempts -gt 0 -or
+            ($latest.runtime -eq 'qqbot-ai-browser' -and (-not $knownAi -or [int]$latest.runtime_version -ge 5 -or
+             -not $latest.browser_resources -or $null -eq $latest.browser_resources.active -or
+             $null -eq $latest.browser_resources.queued -or [int]$latest.browser_resources.active -gt 0 -or
+             [int]$latest.browser_resources.queued -gt 0))) {
+            throw '迁移前空闲复查未通过'
+        }
+        $taskLatestOwners = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $Port -State Listen -ErrorAction Stop |
+            Select-Object -ExpandProperty OwningProcess -Unique)
+        if ($taskLatestOwners.Count -ne 1 -or $taskLatestOwners[0] -ne $legacyProcess.ProcessId) {
+            throw '迁移前监听进程已经变化，不停止任何进程'
+        }
+        Stop-Process -Id $legacyProcess.ProcessId -ErrorAction Stop
+        for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            if (-not (Test-FlowPortInUse)) {
+                Write-FlowLog '已停止空闲旧 Flow 服务，正在加载新版 AI 浏览器任务服务。' ([ConsoleColor]::Green)
+                return $true
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        throw '旧 Flow 服务端口尚未释放'
+    } catch {
+        Write-FlowLog "旧 Flow 服务未迁移：$($_.Exception.Message)" ([ConsoleColor]::Yellow)
+        return $false
     }
-    return $true
 }
 
 function Test-FlowPortInUse {
@@ -450,17 +380,23 @@ function Test-FlowPortInUse {
 }
 
 function Start-FlowApi {
-    # Configure both browser sessions before launching Node so the child
-    # inherits FLOW_STORAGE_STATE(_2)/FLOW_COOKIES_FILE(_2).  A missing session is still
-    # non-fatal for the QQ service; the generated task will report the exact
-    # setup error rather than blocking the main agent.
-    [void](Ensure-FlowSession)
-    [void](Ensure-FlowProfileRoot)
+    # Configure only profile paths; missing authentication requires a normal
+    # browser login, not an exported cookie or storage-state injection.
+    if (-not (Ensure-FlowSession)) { return $null }
     [void](Ensure-FlowBrowserExecutable)
 
     if (Test-FlowHealth) {
-        [void](Test-FlowReadiness)
+        Write-FlowLog 'Flow 按需服务已在线；启动和健康查询不会预加载 Chrome，浏览器全局最多 1 个。'
         return $null
+    }
+
+    $existingHealth = Get-FlowHealth
+    if ($existingHealth -and $existingHealth.ok -eq $true) {
+        if ($existingHealth.runtime -eq 'qqbot-ai-browser' -and [int]$existingHealth.runtime_version -ge 5) {
+            Write-FlowLog '现有 Flow 服务未满足新版按需/单浏览器资源约束；未自动结束其任务，请关闭旧 Flow 服务及守护后重新启动。' ([ConsoleColor]::Yellow)
+            return $null
+        }
+        if (-not (Remove-IdleLegacyFlowApi -Health $existingHealth)) { return $null }
     }
 
     if (Test-FlowPortInUse) {
@@ -490,10 +426,21 @@ function Start-FlowApi {
     $stdoutPath = Join-Path $logDirectory 'flow-api.stdout.log'
     $stderrPath = Join-Path $logDirectory 'flow-api.stderr.log'
 
-    # These values are inherited by the child process.  Existing credentials
-    # (FLOW_API_KEY, FLOW_STORAGE_STATE(_2), FLOW_COOKIES_FILE(_2), etc.) are preserved.
+    # These values are inherited by the child process; FLOW_API_KEY is preserved.
     $env:FLOW_API_HOST = '127.0.0.1'
     $env:FLOW_API_PORT = "$Port"
+    $repositoryRoot = Split-Path -Parent (Split-Path -Parent $scriptPath)
+    $aiEntrypoint = Join-Path $repositoryRoot 'scripts\flow-ai\api.mjs'
+    if (-not (Test-Path -LiteralPath $aiEntrypoint -PathType Leaf)) {
+        throw "QQBot AI Flow 浏览器任务入口不存在：$aiEntrypoint"
+    }
+    $env:FLOW_VIDEO_PROJECT_DIR = $project
+    if ($DataDir) { $env:QQ_AI_DATA_DIR = $DataDir }
+    $pythonCandidate = Join-Path $repositoryRoot '.venv\Scripts\python.exe'
+    if (Test-Path -LiteralPath $pythonCandidate -PathType Leaf) {
+        $env:FLOW_AI_PYTHON = $pythonCandidate
+    }
+    $env:FLOW_POLL_MS = '5000'
     # Queue time is not counted. Once a worker has submitted the request, allow
     # up to 20 minutes for Flow to return and download the generated video.
     $env:FLOW_TIMEOUT_MS = '1200000'
@@ -504,11 +451,11 @@ function Start-FlowApi {
     }
 
     try {
-        $process = Start-Process -FilePath $node -ArgumentList @('src/api-server.js') -WorkingDirectory $project -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
-        Write-FlowLog "已启动 Google Flow API（PID $($process.Id)，端口 $Port），正在执行严格可用性检测。日志：$stderrPath" ([ConsoleColor]::Green)
+        $process = Start-Process -FilePath $node -ArgumentList @(('"{0}"' -f $aiEntrypoint)) -WorkingDirectory $repositoryRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+        Write-FlowLog "已启动 QQBot AI Flow 按需服务（PID $($process.Id)，端口 $Port），正在检查服务健康；不会打开 Chrome，尚未进行账号认证检测。日志：$stderrPath" ([ConsoleColor]::Green)
         for ($attempt = 0; $attempt -lt 15; $attempt++) {
             if (Test-FlowHealth) {
-                [void](Test-FlowReadiness)
+                Write-FlowLog 'Flow 按需服务已在线；未启动任何浏览器，生成或人工登录时才打开，浏览器全局最多 1 个。'
                 break
             }
             if ($process.HasExited) {
@@ -563,14 +510,6 @@ function Start-Guard {
     if ($FlowProjectDir) {
         $arguments += '-FlowProjectDir'
         $arguments += ('"{0}"' -f $FlowProjectDir)
-    }
-    if ($FlowCookiesFile) {
-        $arguments += '-FlowCookiesFile'
-        $arguments += ('"{0}"' -f $FlowCookiesFile)
-    }
-    if ($FlowCookiesFile2) {
-        $arguments += '-FlowCookiesFile2'
-        $arguments += ('"{0}"' -f $FlowCookiesFile2)
     }
     if ($DataDir) {
         $arguments += '-DataDir'
